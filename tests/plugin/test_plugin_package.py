@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -82,6 +83,9 @@ def test_node_launcher_resolves_explicit_python_cross_platform() -> None:
             **os.environ,
             "ARGUS_PLUGIN_PYTHON": sys.executable,
             "ARGUS_PLUGIN_LAUNCHER_DRY_RUN": "1",
+            "PYTHONPATH": os.pathsep.join(
+                filter(None, (str(ROOT), os.environ.get("PYTHONPATH")))
+            ),
         },
     )
 
@@ -185,8 +189,12 @@ def test_target_disease_skill_routes_manager_to_medical_vertical() -> None:
     assert "Do not dispatch while resolving the project" in skill
 
 
-def test_plugin_documentation_covers_both_hosts_and_medical_boundary() -> None:
+def test_documentation_covers_both_hosts_and_medical_boundary() -> None:
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    readme_zh = (ROOT / "README.zh-CN.md").read_text(encoding="utf-8")
     plugin_readme = (PLUGIN / "README.md").read_text(encoding="utf-8")
+    assert "docs/plugin.md" in readme
+    assert "docs/plugin.md" in readme_zh
     assert "install.sh" in plugin_readme
     assert "install.ps1" in plugin_readme
     assert "medical` vertical" in plugin_readme
@@ -195,12 +203,13 @@ def test_plugin_documentation_covers_both_hosts_and_medical_boundary() -> None:
 def test_one_command_installer_and_short_guide() -> None:
     installer = PLUGIN / "install.sh"
     windows_installer = PLUGIN / "install.ps1"
-    guide = PLUGIN / "README.md"
+    guide = ROOT / "docs" / "plugin.md"
 
     assert installer.is_file()
     assert windows_installer.is_file()
     assert os.access(installer, os.X_OK)
-    subprocess.run(["sh", "-n", str(installer)], check=True)
+    if shutil.which("sh"):
+        subprocess.run(["sh", "-n", str(installer)], check=True)
 
     installer_text = installer.read_text(encoding="utf-8")
     windows_installer_text = windows_installer.read_text(encoding="utf-8")
@@ -211,7 +220,7 @@ def test_one_command_installer_and_short_guide() -> None:
 
     assert "ARGUS_HOME" in installer_text
     assert "Node.js 22.12+" in installer_text
-    assert 'repo="microsoft/ArgusAgent"' in installer_text
+    assert 'repo="lbx154/Argus"' in installer_text
     assert 'codex plugin marketplace add "$repo" --ref main' in installer_text
     assert 'claude plugin marketplace add "$repo"' in installer_text
     assert "py -m pip install --upgrade --force-reinstall" in windows_installer_text

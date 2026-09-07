@@ -494,7 +494,10 @@ export function App({
       pasteActiveRef.current = paste.active;
       if (pendingDecision && paste.text) {
         const freeform = pendingDecision.options.length === 0;
-        const custom = pendingDecision.options.findIndex((option) => option.requires_note);
+        const selected = pendingDecision.options[decisionSelection];
+        const custom = selected?.requires_note
+          ? decisionSelection
+          : pendingDecision.options.findIndex((option) => option.id === 'custom');
         if (freeform || custom >= 0) {
           if (custom >= 0) {
             setDecisionSelection(custom);
@@ -582,7 +585,7 @@ export function App({
         return;
       }
       if (input && !key.ctrl && !key.meta) {
-        const custom = pendingDecision.options.findIndex((option) => option.requires_note);
+        const custom = pendingDecision.options.findIndex((option) => option.id === 'custom');
         if (custom >= 0) {
           setDecisionSelection(custom);
           setDecisionNote((current) => insert(current, input));
@@ -863,7 +866,7 @@ export function App({
 
   return (
     <Box flexDirection="column" paddingX={1}>
-      <Header width={terminal.columns} />
+      <Header width={terminal.columns} vertical={missionView?.routing.vertical} />
       {!slashMenuOpen ? <GuardianBanner alert={activeGuardianAlert(events)} /> : null}
       {pendingDecision ? (
         <PendingDecisionPrompt

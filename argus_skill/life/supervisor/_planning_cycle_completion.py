@@ -12,26 +12,237 @@ returned a non-error verdict but before any backlog dedupe/enqueue.
 from __future__ import annotations
 
 from dataclasses import replace
+from pathlib import Path
 from typing import Any
 
 from ...core.event_catalog import EventType
 from ...core.planner_verdict import PlannerVerdictStatus
 from ..memory import BacklogItem
 from ._constants import (
+    COMPLETION_REJECTION_CIRCUIT_THRESHOLD,
     PLAN_ERROR,
     PLAN_RETRY,
     PLAN_TERMINAL_IDLE,
+    PLANNER_TASKS_FILTERED_DIAGNOSTIC,
 )
 from ._planning_cycle_helpers import (
     _PlanCycleState,
     _research_project_done_issue,
     _staged_goal_completion_issue,
+    clear_completion_rejection_circuit,
+    completion_rejection_circuit_path,
     goal_gate_task_title,
+    pause_completion_rejection_circuit,
+    record_completion_rejection,
 )
 
 
 class PlanningCycleCompletionMixin:
     """Waiting handling + project_done normalization + no-tasks rejection."""
+
+    def _completion_rejection_circuit_file(self) -> Path:
+        root = (
+            getattr(self.config, "project_state_dir", None)
+            or getattr(getattr(self, "memory", None), "root", None)
+            or self._artifact_root()
+        )
+        return completion_rejection_circuit_path(
+            Path(str(root)),
+            str(getattr(self.config, "continuous_objective", "") or ""),
+        )
+
+    def _completion_rejection_stop_loss(
+        self,
+        *,
+        stage: str,
+        reason: str,
+        diagnostic: str,
+    ) -> str | None:
+        """Stop the completion loop once one reason has turned it back 3 times.
+
+        Every completion attempt is a paid Planner call. When the standing
+        requirement and the Planner cannot satisfy each other, the exchange
+        repeats verbatim — one live project produced 58 identical turn-backs
+        (missing_publishable_reviewer_certification) in 48 hours. Count the
+        consecutive same-reason turn-backs durably; at the threshold, tell the
+        operator in plain language and stop attempting completion until the
+        backlog changes or the operator replies (the intake phase lifts the
+        pause — the same wake conditions the feedback hold already uses).
+        Returns ``PLAN_TERMINAL_IDLE`` when paused, else ``None``.
+        """
+        record = record_completion_rejection(
+            self._completion_rejection_circuit_file(),
+            diagnostic=diagnostic,
+            reason=reason,
+        )
+        count = int(record.get("consecutive_rejections") or 0)
+        if count < COMPLETION_REJECTION_CIRCUIT_THRESHOLD:
+            return None
+        try:
+            backlog_signature = self._backlog_planning_signature()
+        except Exception:  # noqa: BLE001 - the pause must still engage
+            backlog_signature = ""
+        pause_completion_rejection_circuit(
+            self._completion_rejection_circuit_file(),
+            backlog_signature=backlog_signature,
+        )
+        message = (
+            f"I have tried to close out this project {count} times in a row, "
+            "and each attempt was turned back for the same reason: "
+            f"{reason} "
+            "I am pausing completion attempts so this exchange stops costing "
+            "money. I will try again when the backlog changes or when you "
+            "reply here; if the requirement itself is wrong, say so and I "
+            "will take a different path."
+        )
+        try:
+            from ...core.operator_messages import publish_operator_message
+
+            publish_operator_message(
+                self.memory.root,
+                text=message,
+                message_id=(
+                    "completion-rejection-circuit-"
+                    f"{record.get('reason_key')}-{count}"
+                ),
+                event_fields={
+                    "completion_rejection_circuit": True,
+                    "stage": stage,
+                },
+            )
+        except Exception as exc:  # noqa: BLE001 - the pause must still engage
+            self._emit({
+                "type": "life.planner.completion_circuit.notify_failed",
+                "error": f"{type(exc).__name__}: {exc}",
+            })
+        self._emit({
+            "type": "life.planner.completion_circuit_opened",
+            "stage": stage,
+            "diagnostic": diagnostic,
+            "reason": reason,
+            "consecutive_rejections": count,
+            "threshold": COMPLETION_REJECTION_CIRCUIT_THRESHOLD,
+            "operator_alert": True,
+            "text": message,
+        })
+        self._emit_status(
+            f"the same completion requirement has turned the Planner back "
+            f"{count} times in a row; pausing completion attempts until the "
+            "backlog changes or the operator replies"
+        )
+        self._enter_idle_backoff()
+        return PLAN_TERMINAL_IDLE
+
+    def _manager_project_completion_context(self) -> dict[str, Any]:
+        """Collect every stage and transition for Manager's completion report."""
+        from ...core.pipeline_state import read_pipeline_state
+        from ...core.stage_certificate import all_stage_reviews
+
+        pipeline = read_pipeline_state(self._artifact_root())
+        stages = pipeline.get("stages")
+        stage_history = pipeline.get("stage_history")
+        rollback_history = pipeline.get("rollback_history")
+        return {
+            "current_stage": str(pipeline.get("current_stage") or ""),
+            "stages": dict(stages) if isinstance(stages, dict) else {},
+            "stage_history": (
+                [dict(row) for row in stage_history if isinstance(row, dict)]
+                if isinstance(stage_history, list)
+                else []
+            ),
+            "rollback_history": (
+                [dict(row) for row in rollback_history if isinstance(row, dict)]
+                if isinstance(rollback_history, list)
+                else []
+            ),
+            "stage_reviews": all_stage_reviews(self.memory.root),
+        }
+
+    def _manager_publish_project_report(self, completion_reason: str) -> str:
+        """Have Manager summarize the completed full stage ledger to the operator."""
+        import hashlib
+        import json
+
+        stage = str(self._current_pipeline_stage() or "")
+        context = self._manager_project_completion_context()
+        fingerprint = hashlib.sha256(
+            json.dumps(
+                {
+                    "objective": self.config.continuous_objective,
+                    "reason": completion_reason,
+                    "context": context,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()[:20]
+        message_id = f"manager-project-report-{fingerprint}"
+        from ...core.transcript import read_turns
+
+        if any(
+            turn.get("message_id") == message_id
+            for turn in read_turns(self.memory.root)
+        ):
+            return "reported"
+
+        report = self._bound_manager().report_project_completion(
+            completion_context=context,
+            continuous_objective=self.config.continuous_objective,
+            completion_reason=completion_reason,
+            on_event=getattr(self.sink, "handle_event", None),
+        )
+        if not str(report or "").strip():
+            self._emit_status("Manager could not produce the project completion report")
+            return PLAN_ERROR
+        try:
+            from ...core.operator_messages import publish_operator_message
+
+            published = publish_operator_message(
+                self.memory.root,
+                text=str(report).strip(),
+                message_id=message_id,
+                event_fields={
+                    "manager_project_report": True,
+                    "current_stage": stage,
+                },
+            )
+            if not published and not any(
+                turn.get("message_id") == message_id
+                for turn in read_turns(self.memory.root)
+            ):
+                self._emit_status("Manager project report could not be published")
+                return PLAN_ERROR
+        except Exception as exc:  # noqa: BLE001 - notification cannot own the verdict
+            self._emit({
+                "type": "life.manager.project_report.failed",
+                "error": f"{type(exc).__name__}: {exc}",
+            })
+            return PLAN_ERROR
+        self._emit({
+            "type": "life.manager.project_report",
+            "stage": stage,
+            "report": str(report).strip(),
+            "stage_count": len(context["stages"]),
+            "transition_count": len(context["stage_history"]),
+            "rollback_count": len(context["rollback_history"]),
+            "message_id": message_id,
+        })
+        self._clear_manager_planner_feedback()
+        return "reported"
+
+    def _manager_final_stage_is_completed(self) -> bool:
+        """Whether Manager has already persisted the terminal stage completion."""
+        from ...skills.vertical_select import (
+            resolve_vertical,
+            vertical_has_current_completion_certificate,
+        )
+
+        root = self._artifact_root()
+        return vertical_has_current_completion_certificate(
+            root,
+            resolve_vertical(root),
+        )
 
     def _pc_complete_terminal_empty_plan(self, state: _PlanCycleState) -> Any:
         verdict = state.verdict
@@ -64,16 +275,28 @@ class PlanningCycleCompletionMixin:
         expected_plan_version = state.expected_plan_version
 
         if verdict.waiting:
-            if self._load_manager_planner_feedback() is not None:
-                self._emit(
-                    {
-                        "type": "life.manager.feedback.unresolved",
-                        "reason": "planner returned waiting instead of revision tasks",
-                    }
-                )
-                self._emit_status("planner ignored unresolved Manager feedback; retry later")
-                self._enter_idle_backoff()
-                return PLAN_ERROR
+            feedback = self._load_manager_planner_feedback()
+            if feedback is not None:
+                diagnostic = str(feedback.get("diagnostic") or "")
+                if diagnostic == PLANNER_TASKS_FILTERED_DIAGNOSTIC:
+                    # Filtered-task feedback says every proposed task
+                    # duplicated live backlog work. A deliberate wait answers
+                    # that feedback instead of dodging it: nothing new is
+                    # schedulable until the live work moves, so hand control
+                    # to the waiting contract rather than another replan.
+                    self._clear_manager_planner_feedback()
+                else:
+                    self._emit(
+                        {
+                            "type": "life.manager.feedback.unresolved",
+                            "reason": "planner returned waiting instead of revision tasks",
+                        }
+                    )
+                    self._emit_status(
+                        "planner ignored unresolved Manager feedback; retry later"
+                    )
+                    self._enter_idle_backoff()
+                    return PLAN_ERROR
             if revision_request is not None:
                 reconciliation_result = self._reconcile_open_ended_planner_waiting(verdict)
                 if reconciliation_result == "rollback":
@@ -167,13 +390,20 @@ class PlanningCycleCompletionMixin:
                     "failed to persist completion rejection; retry later"
                 )
                 return PLAN_ERROR
-            self._reset_idle_backoff()
             self._emit({
                 "type": "life.planner.completion_rejected",
                 "stage": stage,
                 "reason": reason,
                 "diagnostic": diagnostic,
             })
+            paused = self._completion_rejection_stop_loss(
+                stage=stage,
+                reason=reason,
+                diagnostic=diagnostic,
+            )
+            if paused is not None:
+                return paused
+            self._reset_idle_backoff()
             self._emit_status(
                 "planner completion rejected; returning the invariant to Planner"
             )
@@ -199,10 +429,12 @@ class PlanningCycleCompletionMixin:
             research_done_issue = _research_project_done_issue(
                 self._artifact_root(),
                 self.memory.journal.all(),
+                current_signature=self._final_submission_signature(),
+                evidence_root=self._project_workdir(),
             )
             if research_done_issue:
                 return reject_completion(
-                    "Research project completion gate held: "
+                    "Research project completion held: "
                     f"{research_done_issue}. A completed report or bounded cycle "
                     "does not satisfy the persisted research target.",
                     "research_target_incomplete",
@@ -215,7 +447,7 @@ class PlanningCycleCompletionMixin:
             if external_gate_issue:
                 return reject_completion(
                     f"Project completion held: {external_gate_issue}. The external "
-                    "controller alone owns this gate.",
+                    "controller alone decides it.",
                     "external_completion_gate_held",
                 )
 
@@ -229,7 +461,7 @@ class PlanningCycleCompletionMixin:
                 return reject_completion(
                     f"{goal_gate_task_title(self._artifact_root())}: "
                     f"{goal_gate_issue}. "
-                    "Planner project_done cannot replace the Goal Gate.",
+                    "Planner project_done cannot replace stage certification.",
                     "staged_goal_gate_incomplete",
                 )
 
@@ -264,6 +496,27 @@ class PlanningCycleCompletionMixin:
             return PLAN_RETRY
 
         if verdict.project_done:
+            if not self._manager_final_stage_is_completed():
+                stage = str(self._current_pipeline_stage() or "")
+                reason = (
+                    f"Project completion cannot be recorded yet: final stage "
+                    f"{stage!r} has not been completed by Manager."
+                )
+                if not self._persist_manager_planner_feedback(
+                    stage=stage,
+                    reason=reason,
+                    diagnostic="manager_final_stage_not_completed",
+                ):
+                    return PLAN_ERROR
+                paused = self._completion_rejection_stop_loss(
+                    stage=stage,
+                    reason=reason,
+                    diagnostic="manager_final_stage_not_completed",
+                )
+                if paused is not None:
+                    return paused
+                self._emit_status(reason)
+                return PLAN_RETRY
             delivered = self._emit_planner_verdict(
                 status=PlannerVerdictStatus.COMPLETED,
                 completion_kind="project_completed",
@@ -280,6 +533,11 @@ class PlanningCycleCompletionMixin:
             )
             if not delivered:
                 return PLAN_RETRY
+            # The requirement was satisfied for real: forget the turn-back
+            # history so a future campaign starts with a clean count.
+            clear_completion_rejection_circuit(
+                self._completion_rejection_circuit_file()
+            )
             self._emit_status(f"planner: project done — {verdict.reason}")
             return False
 
@@ -289,7 +547,7 @@ class PlanningCycleCompletionMixin:
     def _pc_reject_if_no_tasks(self, state: _PlanCycleState) -> Any | None:
         verdict = state.verdict
         revision_request = state.revision_request
-        if verdict.new_tasks:
+        if verdict.new_tasks or verdict.retire_tasks:
             return None
         if revision_request is not None:
             self._emit(

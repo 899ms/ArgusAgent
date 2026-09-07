@@ -7,17 +7,18 @@ import shlex
 from collections.abc import Sequence
 
 EFFECTIVE_TASK_CONTRACT = (
-    "## Effective task contract\n"
-    "Current operator > objective > mission > preregistration; memory is advice. Do not "
-    "add unrelated cleanup or hardening. Naming an output does not authorize replacing "
-    "existing files. Validate once. Report same-level conflicts as `ambiguous_objective`."
+    "## Task authority\n"
+    "Follow operator>objective>mission>preregistration; memory advises. Add no "
+    "unrelated cleanup, hardening, or substitute outputs. Recheck material changes, "
+    "never unchanged work. Limit output; no `.git` or Git retries. "
+    "Equal authority in conflict means `ambiguous_objective`."
 )
 
 NATIVE_WINDOWS_SHELL_CONTRACT = (
-    "## Native Windows shell contract\n"
+    "## Running commands on native Windows\n"
     "This host is native Windows. Generate and run commands with syntax "
     "compatible with Windows PowerShell 5.1. POSIX snippets in Skills, "
-    "checklists, documentation, or prior messages express intent only; "
+    "stage guidance, documentation, or prior messages express intent only; "
     "translate them before execution.\n"
     "- Do not use `&&`, `||`, `test`, `command -v`, `which`, `source`, "
     "`export`, bare POSIX `$VAR` environment references, or POSIX "

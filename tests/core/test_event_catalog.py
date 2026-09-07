@@ -147,6 +147,39 @@ def test_project_completion_events_are_typed_cross_component_signals() -> None:
     assert EventType.PROJECT_COMPLETION_REFUSED.value in SIGNAL_EVENT_TYPES
 
 
+def test_planner_wait_family_events_accept_cycle_zero_from_a_fresh_boot() -> None:
+    # A daemon that resumes a durable wait, or restores an already delivered
+    # terminal conclusion from the outbox, emits these before any planning
+    # cycle has run in the new process. There, cycle == 0 is the honest count
+    # of cycles completed so far -- the same convention life.planner.start
+    # already allows.
+    waiting = normalize_event_envelope({
+        "type": EventType.LIFE_PLANNER_WAITING,
+        "cycle": 0,
+        "reason": "awaiting declared event",
+        "model_call_skipped": True,
+        "wait_mode": "event",
+    })
+    assert "event_validation" not in waiting
+
+    terminal_idle = normalize_event_envelope({
+        "type": EventType.LIFE_PLANNER_TERMINAL_IDLE,
+        "cycle": 0,
+        "reason": "open-ended project_done unchanged since last planner run",
+        "consecutive_idle_cycles": 0,
+        "suggested_sleep_s": 30.0,
+    })
+    assert "event_validation" not in terminal_idle
+
+    # A negative cycle is still a defect, never a boot-time value.
+    negative = validate_event_envelope({
+        "type": "life.planner.waiting",
+        "cycle": -1,
+    })
+    assert negative.valid is False
+    assert "field cycle must be >= 0" in negative.errors
+
+
 def test_unknown_vertical_events_remain_extensible_and_legacy_aliases_are_explicit() -> None:
     unknown = validate_event_envelope({"type": "research.custom_evidence.ready"})
     assert unknown.valid is True
@@ -218,7 +251,7 @@ def test_payload_schema_is_standard_json_schema_and_generated_types_are_current(
         })
     assert payload["schema_version"] == EVENT_PAYLOAD_SCHEMA_VERSION
     assert set(payload["events"]) == set(EVENT_PAYLOAD_SCHEMAS)
-    assert set(payload["events"]) <= {event.value for event in EventType}
+    assert set(payload["events"]) == {event.value for event in EventType}
 
     generated = (
         Path(__file__).parents[2]
@@ -229,3 +262,37 @@ def test_payload_schema_is_standard_json_schema_and_generated_types_are_current(
     ).read_text(encoding="utf-8")
     assert f"EVENT_PAYLOAD_SCHEMA_VERSION = {EVENT_PAYLOAD_SCHEMA_VERSION}" in generated
     assert all(event_type in generated for event_type in payload["events"])
+
+
+def test_generated_event_renderer_corpus_and_coverage_are_current() -> None:
+    from argus_skill.release_tools import generate_event_fixtures
+
+    corpus = json.loads(generate_event_fixtures.CORPUS_PATH.read_text(encoding="utf-8"))
+    report = json.loads(generate_event_fixtures.COVERAGE_PATH.read_text(encoding="utf-8"))
+    expected_types = {event.value for event in EventType}
+
+    assert {row["event"]["type"] for row in corpus["fixtures"]} == expected_types
+    assert all(validate_event_envelope(row["event"]).valid for row in corpus["fixtures"])
+    assert set(report["event_types"]) == expected_types
+    assert generate_event_fixtures.CORPUS_PATH.read_text(encoding="utf-8") == (
+        generate_event_fixtures._json_text(generate_event_fixtures._corpus())
+    )
+    assert generate_event_fixtures.COVERAGE_PATH.read_text(encoding="utf-8") == (
+        generate_event_fixtures._json_text(generate_event_fixtures._coverage())
+    )
+    assert generate_event_fixtures.TYPES_PATH.read_text(encoding="utf-8") == (
+        generate_event_fixtures._types()
+    )
+
+
+def test_resource_status_schema_and_generated_contracts_are_current() -> None:
+    from argus_skill.release_tools import generate_resource_status
+
+    schema = json.loads(generate_resource_status.SCHEMA_PATH.read_text(encoding="utf-8"))
+    jsonschema.Draft202012Validator.check_schema(schema)
+    assert generate_resource_status.OUTPUT_PATH.read_text(encoding="utf-8") == (
+        generate_resource_status.render()
+    )
+    assert generate_resource_status.PYTHON_OUTPUT_PATH.read_text(encoding="utf-8") == (
+        generate_resource_status.render_python()
+    )

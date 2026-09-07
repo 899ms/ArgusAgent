@@ -76,6 +76,16 @@ class SessionMeta:
         )
 
 
+def session_workdir_is_bound(meta: SessionMeta | None) -> bool:
+    return bool(
+        meta is not None
+        and (
+            str(meta.workdir or "").strip()
+            or str(meta.cwd or "").strip()
+        )
+    )
+
+
 def resolve_session_workdir(
     meta: SessionMeta | None,
     *,
@@ -103,6 +113,8 @@ def resolve_session_workdir(
         if not resolved.is_dir():
             raise NotADirectoryError(f"legacy session cwd is not a directory: {resolved}")
         return resolved
+    if meta is not None:
+        raise FileNotFoundError("session metadata has no trustworthy workdir")
     return fallback
 
 
@@ -121,7 +133,7 @@ def migrate_legacy_session_workdir(
                 f"legacy session state directory is unavailable: {fallback}"
             )
         meta = read_session_meta(global_root, sid)
-        if meta is not None:
+        if session_workdir_is_bound(meta):
             return resolve_session_workdir(meta, state_dir=fallback)
         workdir: Path | None = None
         for candidate in candidates:
@@ -142,11 +154,10 @@ def migrate_legacy_session_workdir(
                 "legacy session has no trustworthy workdir; resume it once "
                 "from its project directory"
             )
-        meta = SessionMeta(
-            id=sid,
-            cwd=str(workdir),
-            workdir=str(workdir),
-        )
+        if meta is None:
+            meta = SessionMeta(id=sid)
+        meta.cwd = str(workdir)
+        meta.workdir = str(workdir)
         _write_session_meta_unlocked(global_root, meta)
         return workdir
 
@@ -291,7 +302,7 @@ def project_exists(global_root: Path | None, sid: str) -> bool:
     return core_paths.session_state_root(sid, root=root).is_dir()
 
 
-def _legacy_last_active(project_dir: Path) -> float:
+def durable_session_activity(project_dir: Path) -> float:
     """Derive activity from durable work, never Web projection/lock files."""
     candidates = (
         "events.jsonl",
@@ -350,7 +361,7 @@ def list_sessions(
         meta = read_session_meta(global_root, d.name)
         if meta is None:
             # Legacy project: synthesise minimal meta so it's resumable.
-            mtime = _legacy_last_active(filesystem_dir)
+            mtime = durable_session_activity(filesystem_dir)
             obj = ""
             try:
                 cj = json.loads(
@@ -360,6 +371,11 @@ def list_sessions(
             except Exception:  # noqa: BLE001
                 pass
             meta = SessionMeta(id=d.name, created=mtime, last_active=mtime, objective=obj)
+        else:
+            meta.last_active = max(
+                meta.last_active,
+                durable_session_activity(filesystem_dir),
+            )
         if not include_empty and not _session_is_meaningful(filesystem_dir, meta):
             continue
         out.append(meta)

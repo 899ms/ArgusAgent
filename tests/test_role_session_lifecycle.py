@@ -121,6 +121,40 @@ def test_mission_policy_resumes_each_role_without_crossing_roles(tmp_path: Path)
     ]
 
 
+def test_fresh_policy_repeats_task_contract_on_continuation_round(
+    tmp_path: Path,
+) -> None:
+    context, checkpoint = _context(tmp_path)
+    backend = MemoryBackend()
+    backend.queue("engineer-r1", CannedResponse(message="one", thread_id="e1"))
+    backend.queue(
+        "reviewer", CannedResponse(message=_review("continue"), thread_id="v1")
+    )
+    backend.queue("engineer-r2", CannedResponse(message="two", thread_id="e2"))
+    backend.queue("reviewer", CannedResponse(message=_review("done"), thread_id="v2"))
+
+    outcome = _loop(
+        backend,
+        tmp_path,
+        context,
+        checkpoint,
+        policy="fresh",
+    ).run("implement the contract-preserving change", workdir=tmp_path)
+
+    assert outcome.successful
+    engineer_prompts = [
+        prompt
+        for label, prompt, _options in backend.history
+        if label.startswith("engineer-")
+    ]
+    assert len(engineer_prompts) == 2
+    assert all('## Task authority' in prompt for prompt in engineer_prompts)
+    assert all(
+        "implement the contract-preserving change" in prompt
+        for prompt in engineer_prompts
+    )
+
+
 def test_resumed_reviewer_reduces_prompt_bytes_without_changing_verdict(
     tmp_path: Path,
 ) -> None:
@@ -254,6 +288,72 @@ def test_rolling_capsule_rotates_when_branch_changes(tmp_path: Path) -> None:
     assert capsule.prepare(max_turns=6, max_input_tokens=120_000) is None
     assert capsule.action == "rotated"
     assert capsule.rotation_reason == "branch_changed"
+
+
+def test_cached_tokens_do_not_count_against_the_rotation_budget(tmp_path: Path) -> None:
+    capsule = RoleSessionCapsule.open(
+        role="engineer",
+        policy="rolling",
+        objective_revision="v1",
+        workdir=tmp_path,
+        backend="codex",
+        model="model",
+        checkpoint_path=None,
+        path=tmp_path / "state" / "engineer.json",
+    )
+
+    capsule.complete(
+        RunnerResult(
+            exit_code=0,
+            thread_id="thread-1",
+            input_tokens=100_000,
+            cached_input_tokens=90_000,
+        )
+    )
+
+    # Only the 10k tokens the provider read fresh count toward rotation; the
+    # raw billed input alone would already exhaust this budget on turn one.
+    assert capsule.input_tokens == 10_000
+    assert capsule.prepare(max_turns=20, max_input_tokens=15_000) == "thread-1"
+    assert capsule.action == "resumed"
+
+    capsule.complete(
+        RunnerResult(
+            exit_code=0,
+            thread_id="thread-1",
+            input_tokens=100_000,
+            cached_input_tokens=95_000,
+        )
+    )
+
+    assert capsule.input_tokens == 15_000
+    assert capsule.prepare(max_turns=20, max_input_tokens=15_000) is None
+    assert capsule.action == "rotated"
+    assert capsule.rotation_reason == "context_limit"
+
+
+def test_result_without_cache_data_counts_its_full_input(tmp_path: Path) -> None:
+    class LegacyResult:
+        exit_code = 0
+        thread_id = "thread-legacy"
+        input_tokens = 50_000
+
+    capsule = RoleSessionCapsule.open(
+        role="engineer",
+        policy="rolling",
+        objective_revision="v1",
+        workdir=tmp_path,
+        backend="codex",
+        model="model",
+        checkpoint_path=None,
+        path=tmp_path / "state" / "engineer.json",
+    )
+
+    capsule.complete(LegacyResult())
+
+    # A result that reports nothing about caching counts in full, which errs
+    # toward rotating sooner rather than trusting an absent number.
+    assert capsule.input_tokens == 50_000
 
 
 def test_planner_mission_session_survives_new_planner_instance(tmp_path: Path) -> None:

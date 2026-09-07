@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -31,7 +32,12 @@ def run(*argv: str, cwd: Path = ROOT) -> None:
             env["ARGUS_RELEASE_PYTHON"] = sys.executable
             shim.write_text('@"%ARGUS_RELEASE_PYTHON%" %*\n', encoding="ascii")
         else:
-            shim.symlink_to(sys.executable)
+            # Following a venv's interpreter symlink can lose its pyvenv.cfg.
+            shim.write_text(
+                f"#!/bin/sh\nexec {shlex.quote(sys.executable)} \"$@\"\n",
+                encoding="utf-8",
+            )
+            shim.chmod(0o755)
         env["PATH"] = os.pathsep.join((shim_dir, env.get("PATH", "")))
         subprocess.run(argv, cwd=cwd, check=True, env=env)
 
@@ -50,6 +56,16 @@ def main() -> int:
         run(
             sys.executable,
             "-m",
+            "argus_skill.release_tools.generate_event_fixtures",
+        )
+        run(
+            sys.executable,
+            "-m",
+            "argus_skill.release_tools.generate_resource_status",
+        )
+        run(
+            sys.executable,
+            "-m",
             "argus_skill.release_tools.generate_manifest",
             "--prepare-build",
         )
@@ -63,7 +79,7 @@ def main() -> int:
     except subprocess.CalledProcessError as exc:
         return int(exc.returncode or 1)
     manifest = json.loads((ROOT / "argus_skill" / "release_manifest.json").read_text())
-    print(f"release ready: {manifest['release_id']}")
+    print(f"release ready: {manifest['package_version']}")
     return 0
 
 

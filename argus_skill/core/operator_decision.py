@@ -18,12 +18,17 @@ def _human_reason(reason: str, *, language_hint: str) -> str:
 
 
 def normalize_agent_options(
-    options: Iterable[Mapping[str, Any]],
+    options: Iterable[Mapping[str, Any] | str],
 ) -> list[dict[str, Any]]:
     normalized: list[dict[str, Any]] = []
     used_ids: set[str] = set()
-    for index, row in enumerate(options):
-        if not isinstance(row, Mapping):
+    rows: Iterable[Mapping[str, Any] | str] = (
+        (options,) if isinstance(options, str) else options
+    )
+    for index, row in enumerate(rows):
+        if isinstance(row, str):
+            row = {"label": row}
+        elif not isinstance(row, Mapping):
             continue
         label = str(row.get("label") or "").strip()[:160]
         if not label:
@@ -44,7 +49,7 @@ def normalize_agent_options(
             "id": option_id,
             "label": label,
             "description": str(row.get("description") or "").strip()[:1000],
-            "requires_note": False,
+            "requires_note": bool(row.get("requires_note")),
         })
         if len(normalized) >= 8:
             break
@@ -79,23 +84,23 @@ def parse_agent_operator_options(message: str) -> list[dict[str, Any]]:
             return []
         if not isinstance(payload, list):
             return []
-        return normalize_agent_options(
-            row for row in payload if isinstance(row, Mapping)
-        )
+        return normalize_agent_options(payload)
     options: list[dict[str, Any]] = []
     for encoded in raw.split(";"):
         parts = [part.strip() for part in encoded.split("::")]
         if len(parts) == 3:
             option_id, label, description = parts
+            requires_note = False
         elif len(parts) == 4:
-            option_id, _legacy_requires_note, label, description = parts
+            option_id, raw_requires_note, label, description = parts
+            requires_note = raw_requires_note.casefold() == "true"
         else:
             continue
         options.append({
             "id": option_id,
             "label": label,
             "description": description,
-            "requires_note": False,
+            "requires_note": requires_note,
         })
     return normalize_agent_options(options)
 
@@ -106,7 +111,7 @@ def build_operator_decision(
     title: str,
     reason: str,
     question: str,
-    options: Iterable[Mapping[str, Any]] = (),
+    options: Iterable[Mapping[str, Any] | str] = (),
     evidence: Iterable[Mapping[str, Any]] = (),
     project_id: str = "",
 ) -> dict[str, Any]:
@@ -157,10 +162,7 @@ def selected_decision_text(card: Mapping[str, Any], option_id: str, note: str) -
     )
     if option is None:
         raise ValueError("unknown decision option")
-    requires_note = (
-        bool(option.get("requires_note"))
-        and str(card.get("options_source") or "") != "agent"
-    )
+    requires_note = bool(option.get("requires_note"))
     if requires_note and not note:
         raise ValueError("this option requires guidance")
     description = str(option.get("description") or "").strip()

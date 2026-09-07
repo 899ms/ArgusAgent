@@ -88,12 +88,20 @@ from ..manager.front_door import (
     ManagerHandoffSupersededError,  # noqa: F401 - used via server_mod.ManagerHandoffSupersededError in webapi/routes/{daemon,workitems}.py
 )
 from . import artifacts, project_state
+from .counterexample_dashboard import (  # noqa: F401 - route delegation export
+    build_counterexample_dashboard,
+)
 from .protocol import build_api_meta, protocol_header
+from .source_update import (  # noqa: F401 - used by routes/meta.py through server_mod
+    read_source_update_status,
+    start_source_update,
+)
 
 log = logging.getLogger(__name__)
 
 _QUIET_ACCESS_PATHS = re.compile(
-    r"^/api/projects(?:/costs|/[^/]+/(?:snapshot|artifacts|git-diff|status|journal))?$"
+    r"^(?:/api/projects(?:/costs|/[^/]+/(?:snapshot|artifacts|git-diff|status|journal))?"
+    r"|/api/runtime/source-update)$"
 )
 
 
@@ -181,6 +189,9 @@ __all__ = [
     "set_operator_config",
     "set_identity",
     "run_skill_command",
+    "read_source_update_status",
+    "start_source_update",
+    "build_counterexample_dashboard",
     "list_project_artifacts",
     "get_project_artifact",
 ]
@@ -271,15 +282,23 @@ def _iter_manager_stream_items(
     """
     now = clock or time.monotonic
     last_real_at = now()
+    active_role = "manager"
+    role_labels = {
+        "manager": "Manager",
+        "planner": "Planner",
+        "engineer": "Engineer",
+        "reviewer": "Reviewer",
+    }
     while True:
         try:
             item = items.get(timeout=heartbeat_s) if heartbeat_s > 0 else items.get()
         except queue.Empty:
             quiet_s = max(0, int(now() - last_real_at))
+            actor = role_labels.get(active_role, active_role.title() or "Manager")
             yield {
                 "type": "phase",
-                "role": "manager",
-                "label": f"Manager · waiting for the next model event · {quiet_s}s quiet",
+                "role": active_role,
+                "label": f"{actor} · waiting for the next model event · {quiet_s}s quiet",
                 "heartbeat": True,
                 "quiet_s": quiet_s,
             }
@@ -287,6 +306,8 @@ def _iter_manager_stream_items(
         if item is None:
             return
         last_real_at = now()
+        if item.get("type") == "phase" and not item.get("heartbeat"):
+            active_role = str(item.get("role") or "manager").strip().lower()
         yield item
 
 
@@ -622,6 +643,7 @@ def create_app(
 
     from .routes.artifacts import register_artifact_routes
     from .routes.context import ServerContext
+    from .routes.counterexamples import register_counterexample_routes
     from .routes.daemon import register_daemon_routes
     from .routes.manager import register_manager_routes
     from .routes.meta import register_meta_routes
@@ -653,6 +675,7 @@ def create_app(
     # ordering are unchanged.
     register_project_routes(app, ctx, server_mod)
     register_workitem_routes(app, ctx, server_mod)
+    register_counterexample_routes(app, ctx, server_mod)
     register_daemon_routes(app, ctx, server_mod)
     register_artifact_routes(app, ctx, server_mod)
     register_manager_routes(app, ctx, server_mod)
@@ -669,8 +692,15 @@ def create_app(
     wheel_dist = Path(__file__).resolve().parents[1] / "_frontend" / "web" / "dist"
     web_dist = source_dist if source_dist.is_dir() else wheel_dist
     if web_dist.is_dir():
+        import mimetypes
+
         from fastapi.staticfiles import StaticFiles
 
+        # Windows' MIME registry commonly has no .mjs mapping. Serving the
+        # PDF.js worker as text/plain makes WebView2 reject the module and then
+        # fail its fake-worker fallback. Register the standards-compliant MIME
+        # before StaticFiles resolves response headers.
+        mimetypes.add_type("text/javascript", ".mjs")
         app.mount("/", StaticFiles(directory=str(web_dist), html=True), name="web")
 
     return app
@@ -684,8 +714,14 @@ def serve(
     auth_token: str | None = None,
 ) -> int:
     """Run the API with uvicorn (blocking). Defaults to a localhost bind."""
-    from ..core.runtime_identity import release_match_preflight_error
+    from ..core.runtime_identity import (
+        release_match_preflight_error,
+        source_root_preflight_error,
+    )
 
+    source_error = source_root_preflight_error()
+    if source_error:
+        raise RuntimeError(f"webapi refused mismatched source root: {source_error}")
     release_error = release_match_preflight_error()
     if release_error:
         raise RuntimeError(f"webapi refused inconsistent release: {release_error}")

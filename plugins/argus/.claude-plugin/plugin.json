@@ -5,8 +5,8 @@
   "author": {
     "name": "Argus contributors"
   },
-  "homepage": "https://github.com/microsoft/ArgusAgent",
-  "repository": "https://github.com/microsoft/ArgusAgent",
+  "homepage": "https://github.com/lbx154/Argus",
+  "repository": "https://github.com/lbx154/Argus",
   "license": "MIT",
   "keywords": ["research", "engineering", "medical", "review"],
   "skills": "./skills/",

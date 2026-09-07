@@ -81,7 +81,7 @@ def _model_visible_context_ref(ref: Mapping[str, Any]) -> dict[str, str]:
 def _read_json_object(path: Path) -> dict[str, Any]:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, TypeError, ValueError):
+    except (OSError, ValueError):
         return {}
     return payload if isinstance(payload, dict) else {}
 
@@ -108,6 +108,115 @@ def render_mission_contract(path: Path | str | None) -> str:
     if non_goals:
         lines.extend(("", "Non-goals:", *(f"- {item}" for item in non_goals)))
     return "\n".join(lines)
+
+
+def _brief_text(value: Any, *, limit: int = 600) -> str:
+    return " ".join(str(value or "").split())[:limit]
+
+
+def _brief_items(value: Any, *, limit: int = 6) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return list(dict.fromkeys(
+        text
+        for item in value
+        if (text := _brief_text(item, limit=400))
+    ))[:limit]
+
+
+def _latest_reviewed_handoff(root: Path) -> dict[str, Any]:
+    """Read the newest sealed Reviewer handoff, ignoring Engineer-only seals."""
+    for path in reversed(sorted(root.glob("round-*.json"))):
+        payload = _read_json_object(path)
+        if str(payload.get("kind") or "") == "round_reviewed_handoff":
+            return payload
+    return {}
+
+
+def render_mission_brief(path: Path | str | None) -> str:
+    """Project canonical mission/frontier state into one compact role briefing.
+
+    The projection selects named semantic fields only. It never reads a
+    checkpoint or transcript and writes no state of its own. The prior round's
+    capped Engineer account is carried explicitly so a fresh continuation does
+    not have to infer work from Reviewer status enums.
+    """
+    if not path:
+        return ""
+    mission_path = Path(path).expanduser()
+    mission = _read_json_object(mission_path)
+    if str(mission.get("kind") or "") != "mission_context":
+        return ""
+
+    frontier: dict[str, Any] = {}
+    frontier_ref = mission.get("frontier")
+    if isinstance(frontier_ref, Mapping):
+        frontier_path = _brief_text(frontier_ref.get("path"), limit=4000)
+        if frontier_path:
+            frontier = _read_json_object(Path(frontier_path).expanduser())
+
+    reviewed = _latest_reviewed_handoff(mission_path.parent)
+    review = reviewed.get("review")
+    review = review if isinstance(review, Mapping) else {}
+    status = _brief_text(review.get("status"), limit=40)
+
+    lines = ["## MissionBrief"]
+    workdir = _brief_text(mission.get("execution_workdir"), limit=4000)
+    stage = _brief_text(mission.get("stage"), limit=120)
+    acceptance = _brief_text(mission.get("acceptance_check"))
+    if workdir:
+        lines.append(f"- Workdir: `{workdir}`")
+    if stage:
+        lines.append(f"- Stage: {stage}")
+    owns_paths = [
+        str(item).strip()
+        for item in (mission.get("owns_paths") or [])
+        if str(item).strip()
+    ]
+    if owns_paths:
+        lines.append(
+            "- Owned paths (authoritative write boundary; Reviewer must not "
+            "request edits outside it): " + "; ".join(owns_paths)
+        )
+
+    changed_surface = _brief_items(frontier.get("artifacts"))
+    if changed_surface:
+        lines.append("- Changed surface: " + "; ".join(changed_surface))
+
+    resources: list[str] = []
+    context_refs = mission.get("context_refs")
+    if isinstance(context_refs, list):
+        for ref in context_refs:
+            if not isinstance(ref, Mapping):
+                continue
+            location = _brief_text(ref.get("ref"), limit=400)
+            if not location:
+                continue
+            kind = _brief_text(ref.get("kind"), limit=80)
+            why = _brief_text(ref.get("why"), limit=240)
+            label = f"{kind}: {location}" if kind else location
+            resources.append(f"{label} ({why})" if why else label)
+    if resources:
+        lines.append("- Tools/resources: " + "; ".join(resources[:6]))
+    if acceptance:
+        lines.append(f"- Native check: {acceptance}")
+
+    reason = _brief_text(review.get("reason"))
+    if reason:
+        result = f"{status}: {reason}" if status else reason
+        lines.append(f"- Decisive result: {result}")
+    engineer_summary = _brief_text(reviewed.get("engineer_summary"), limit=1200)
+    if engineer_summary:
+        lines.append(f"- Engineer account: {engineer_summary}")
+    if reviewed and status != "done":
+        missing = _brief_items(frontier.get("remaining_work"))
+        if missing:
+            lines.append("- Missing condition: " + "; ".join(missing))
+    next_action = _brief_text(review.get("next_action"))
+    if next_action:
+        lines.append(f"- Next action: {next_action}")
+
+    return "\n".join(lines) if len(lines) > 1 else ""
 
 
 def _attach_mission_metadata(
@@ -150,6 +259,7 @@ def create_mission_context(
     expected_regressions: str = "",
     decision_rule: str = "",
     execution_workdir: str = "",
+    owns_paths: list[str] | None = None,
     non_goals: list[str] | None = None,
     context_refs: list[dict[str, str]] | None = None,
     plan_id: str = "",
@@ -199,6 +309,11 @@ def create_mission_context(
         "expected_regressions": str(expected_regressions or "").strip(),
         "decision_rule": str(decision_rule or "").strip(),
         "execution_workdir": str(execution_workdir or "").strip(),
+        "owns_paths": [
+            str(item).strip()
+            for item in (owns_paths or [])
+            if str(item).strip()
+        ],
         "non_goals": [str(item).strip() for item in (non_goals or []) if str(item).strip()],
         "context_refs": [
             _model_visible_context_ref(ref)
@@ -241,7 +356,6 @@ def record_engineer_handoff(
         return None
     mission_path = Path(mission_context_path)
     root = mission_path.parent
-    _ = engineer_summary
     payload = {
         "schema_version": CONTEXT_PACKET_VERSION,
         "kind": "round_engineer_handoff",
@@ -249,6 +363,7 @@ def record_engineer_handoff(
         "mission_id": root.name,
         "round": max(1, int(round_index)),
         "producer_role": "engineer",
+        "engineer_summary": str(engineer_summary or "").strip()[:4000],
         "session_id": str(thread_id or ""),
         "checkpoint": _file_reference(checkpoint_path),
         "frontier": _file_reference(root / FRONTIER_FILENAME),
@@ -278,13 +393,34 @@ def record_reviewed_handoff(
         return None
     mission_path = Path(mission_context_path)
     root = mission_path.parent
-    _ = engineer_summary
     review_payload: dict[str, Any] = {
         "status": str(getattr(review, "status", "") or ""),
         "reason": str(getattr(review, "reason", "") or "")[:4000],
         "next_action": str(getattr(review, "next_action", "") or "")[:4000],
         "operator_question": str(getattr(review, "operator_question", "") or "")[:1000],
     }
+    review_source = str(getattr(review, "review_source", "") or "").strip()
+    if review_source:
+        review_payload["review_source"] = review_source
+    manuscript_binding = getattr(review, "manuscript_snapshot", None)
+    if isinstance(manuscript_binding, dict):
+        review_payload["manuscript_snapshot"] = dict(manuscript_binding)
+    mission = _read_json_object(mission_path)
+    if (
+        str(mission.get("scope") or "").strip().lower() == "final_submission"
+        and isinstance(manuscript_binding, dict)
+    ):
+        candidate_root_text = str(mission.get("execution_workdir") or "").strip()
+        candidate_root = Path(candidate_root_text).expanduser()
+        if candidate_root_text and candidate_root.is_dir():
+            from .terminal_state import build_project_state_signature
+
+            review_payload["final_submission_signature"] = (
+                build_project_state_signature(
+                    project_root=candidate_root,
+                    state_root=root,
+                )
+            )
     frontier_path = root / FRONTIER_FILENAME
     from ..core.task_frontier import load_task_frontier, save_task_frontier
 
@@ -305,6 +441,7 @@ def record_reviewed_handoff(
         "mission_id": root.name,
         "round": max(1, int(round_index)),
         "producer_role": "reviewer",
+        "engineer_summary": str(engineer_summary or "").strip()[:4000],
         "review": review_payload,
         "checkpoint": _file_reference(checkpoint_path),
         "frontier": _file_reference(frontier_path),
@@ -331,5 +468,6 @@ __all__ = [
     "mission_context_dir",
     "record_engineer_handoff",
     "record_reviewed_handoff",
+    "render_mission_brief",
     "render_mission_contract",
 ]

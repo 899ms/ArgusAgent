@@ -108,7 +108,7 @@ for the installed version if it does not discover the directory automatically.
 
 ## Attribution
 
-Inspired by [Argus](https://github.com/microsoft/ArgusAgent), especially its separation of
+Inspired by [Argus](https://github.com/lbx154/Argus), especially its separation of
 planning, execution, and review and its use of durable project memory. This Skill is
 an independent community contribution, not an official Argus compatibility layer or
 a benchmarked claim of superiority.

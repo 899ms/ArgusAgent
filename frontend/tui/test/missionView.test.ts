@@ -201,6 +201,7 @@ test('new failure event wins over an older running snapshot', () => {
 test('snapshot refreshes certified achievement counters from current state', () => {
   const current = snapshot();
   current.mission_view = emptyMissionView();
+  current.mission_view.mission.id = 'task-1';
   current.mission_view.mission.started_at = Date.now() / 1000 - 3_600;
   current.mission_view.mission.status = 'working';
   current.mission_view.learned_skills = [{ id: 's1', name: 'skill', status: 'active' }];
@@ -332,7 +333,7 @@ test('live snapshot preserves authoritative completed pipeline roles', () => {
   });
   Object.assign(live.mission_view.roles.find((role) => role.role === 'reviewer')!, {
     status: 'waiting',
-    label: 'Awaiting engineer handoff',
+    label: 'Waiting for the Engineer to finish',
   });
 
   const view = projectMissionView(live);
@@ -343,7 +344,7 @@ test('live snapshot preserves authoritative completed pipeline roles', () => {
       ['manager', 'done', 'Goal framed'],
       ['planner', 'done', 'Research branch added'],
       ['engineer', 'active', 'editing manuscript'],
-      ['reviewer', 'waiting', 'Awaiting engineer handoff'],
+      ['reviewer', 'waiting', 'Waiting for the Engineer to finish'],
     ],
   );
 });

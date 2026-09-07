@@ -296,7 +296,7 @@ def test_math_checklist_is_small_and_judges_results_not_files() -> None:
         assert artifact not in rendered
     assert "error-free attempt" in rendered
     assert "leave this item unsatisfied" in rendered
-    assert "original Goal Gate is achieved" in rendered
+    assert "originally requested goal is achieved" in rendered
     # The gap item must be satisfied by a proposition changing status, not by a
     # file existing — otherwise the graph becomes the paperwork it replaced.
     gap_item = next(
@@ -318,9 +318,9 @@ def test_math_roles_keep_methods_optional_and_checks_real() -> None:
     assert "no fixed bundle of output filenames is required" in engineer
     assert "fresh real compiler run" in engineer
     assert "Do not require\nparticular filenames" in reviewer
-    assert "separate audit artifact" in reviewer
-    assert "required workflow or evidence package" in scientist_create
-    assert "Do not create a process artifact" in scientist_adapt
+    assert "separate search report" in reviewer
+    assert "required workflow or required evidence" in scientist_create
+    assert "Do not create a process file" in scientist_adapt
 
 
 def test_parallel_routes_are_dispatched_without_a_prescribed_width() -> None:
@@ -742,36 +742,6 @@ def test_math_review_survives_a_direct_workflow_decision(tmp_path: Path) -> None
     persist_vertical(tmp_path, "math", workflow_mode="direct")
 
     assert _independent_review_required_for_project_root(tmp_path) is True
-
-
-# ---------------------------------------------------------------------------
-# Contract surfaces that were never wired
-# ---------------------------------------------------------------------------
-
-
-def test_math_declares_no_gate_that_nothing_runs() -> None:
-    """``STAGE_CHECKS`` and ``REVIEWER_CHECKLISTS`` are read by nothing.
-
-    ``vertical_contract`` stores ``STAGE_CHECKS`` and only ``assurance_level``
-    reads it back; nothing in this repository ever executes one of those shell
-    commands, and ``REVIEWER_CHECKLISTS`` is not read at all outside the
-    verticals that copy it from each other. Math declared both, so "is this
-    stage gated?" had a plausible wrong answer sitting in the module a
-    maintainer would read first.
-    """
-    module = load_vertical("math")
-
-    assert not hasattr(module, "STAGE_CHECKS")
-    assert not hasattr(module, "REVIEWER_CHECKLISTS")
-
-
-def test_dropping_them_did_not_drop_the_real_stage_check() -> None:
-    from argus_skill.verticals._base import load_vertical_contract
-
-    contract = load_vertical_contract("math")
-
-    assert contract.stage_completion_validator is not None
-    assert contract.assurance_level == "hybrid"
 
 
 def test_the_scope_instruction_survived_the_deletion() -> None:

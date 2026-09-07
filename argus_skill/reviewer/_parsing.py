@@ -10,6 +10,7 @@ from ..core.model_visible_text import (
     contains_integrity_judgment,
     has_material_blocker,
     sanitize_model_judgment_text,
+    sanitize_model_visible_text,
 )
 from ..core.models import ReviewDecision
 from ..core.operator_decision import (
@@ -78,13 +79,23 @@ def _planner_report_from_payload(parsed: Mapping[str, Any]) -> dict[str, Any]:
     plan itself had become the obstacle.
     """
     nested = parsed.get("planner_report")
-    source = nested if isinstance(nested, dict) else parsed
+    sources = (nested, parsed) if isinstance(nested, dict) else (parsed,)
+
+    def field(*names: str) -> Any:
+        # Fill only absent fields from the flat event. Explicit nested values,
+        # including false, empty strings and None, remain authoritative.
+        for source in sources:
+            for name in names:
+                if name in source:
+                    return source[name]
+        return None
+
     return _planner_report(
-        forward_progress=source.get("forward_progress"),
-        plan_signal=source.get("plan_signal"),
-        challenge=source.get("challenge", source.get("plan_challenge")),
-        alternative=source.get("alternative", source.get("plan_alternative")),
-        authority_impact=source.get("authority_impact"),
+        forward_progress=field("forward_progress"),
+        plan_signal=field("plan_signal"),
+        challenge=field("challenge", "plan_challenge"),
+        alternative=field("alternative", "plan_alternative"),
+        authority_impact=field("authority_impact"),
     )
 
 
@@ -159,29 +170,48 @@ def _session_signal(value: Any) -> dict[str, str]:
 
 
 def _apply_model_judgment_policy(decision: ReviewDecision) -> ReviewDecision:
-    """Ensure opaque integrity identifiers cannot become Reviewer blockers."""
+    """Ignore hash-only blockers without overruling substantive judgment."""
     original_reason = str(decision.reason or "")
     original_next_action = str(decision.next_action or "")
-    integrity_judgment = contains_integrity_judgment(original_reason + "\n" + original_next_action)
-    decision.reason = sanitize_model_judgment_text(original_reason)
-    decision.next_action = sanitize_model_judgment_text(original_next_action)
+    original_judgment = original_reason + "\n" + original_next_action
+    integrity_judgment = contains_integrity_judgment(original_judgment)
+    material_blocker = has_material_blocker(original_judgment)
+
+    def sanitize_without_gutting_material_paragraphs(value: str) -> str:
+        kept: list[str] = []
+        for paragraph in value.splitlines():
+            sanitized = sanitize_model_judgment_text(paragraph)
+            if not sanitized and paragraph.strip() and has_material_blocker(paragraph):
+                # Redact opaque values, but retain a paragraph whose engineering
+                # meaning would otherwise disappear with its integrity wording.
+                sanitized = sanitize_model_visible_text(paragraph).strip()
+            if sanitized:
+                kept.append(sanitized)
+        return "\n".join(kept)
+
+    decision.reason = sanitize_without_gutting_material_paragraphs(original_reason)
+    decision.next_action = sanitize_without_gutting_material_paragraphs(
+        original_next_action
+    )
     decision.operator_question = sanitize_model_judgment_text(decision.operator_question)
     if (
-        decision.status != "done"
+        decision.status == "blocked"
         and integrity_judgment
         and not decision.operator_question
         and not decision.next_action
-        and not has_material_blocker(decision.reason)
+        and not material_blocker
     ):
-        decision.status = "done"
-        decision.reason = decision.reason or (
-            "No model-relevant blocker remains after ignoring machine-only integrity metadata."
+        decision.status = "continue"
+        policy_note = (
+            "Policy note: machine-only integrity metadata does not by itself "
+            "justify blocking the project."
         )
+        decision.reason = "\n".join(filter(None, (decision.reason, policy_note)))
     elif not decision.reason:
-        decision.reason = (
-            "The Reviewer cited only machine-only integrity metadata and did not "
-            "identify a semantic blocker."
-        )
+        # Preserve the Reviewer's text whenever possible. This fallback only
+        # covers a non-blocked verdict whose entire rationale was an opaque
+        # integrity assertion.
+        decision.reason = sanitize_model_visible_text(original_reason).strip()
     frontier = decision.frontier_report
     if isinstance(frontier, dict):
         change = str(frontier.get("change") or "")
@@ -192,26 +222,13 @@ def _apply_model_judgment_policy(decision: ReviewDecision) -> ReviewDecision:
             for key in ("cause", "scope", "budget", "recovery_test", "exit_trigger")
         )
         if change == "bounded_regression" and not envelope_complete:
-            decision.status = "replan_requested"
             decision.reason += (
-                " The reported regression has no complete cause, scope, budget, "
-                "recovery test, and exit trigger, so it cannot be accepted as bounded."
+                " Note: the bounded-regression report omitted one or more of cause, "
+                "scope, budget, recovery test, and exit trigger."
             )
-            decision.next_action = (
-                "Replan with a complete regression envelope or restore the prior frontier."
-            )
-            decision.planner_report.update({
-                "forward_progress": False,
-                "plan_signal": "reconsider",
-                "challenge": "The proposed regression was not bounded.",
-                "alternative": "Bound the repair debt or choose a route without it.",
-                "authority_impact": "technical",
-            })
         elif change == "expanding_regression" and decision.status == "done":
-            decision.status = "replan_requested"
-            decision.next_action = (
-                decision.next_action
-                or "Diagnose the expanding regression and revise or abandon the route."
+            decision.reason += (
+                " Note: the same judgment reports an expanding regression."
             )
     return decision
 
@@ -301,17 +318,15 @@ def decision_from_payload(payload: Mapping[str, Any]) -> ReviewDecision | None:
         return None
     if operator_question is not None and not isinstance(operator_question, str):
         return None
+    raw_options = payload.get("operator_options")
+    option_values = raw_options if isinstance(raw_options, (list, tuple)) else ()
     return _apply_model_judgment_policy(
         ReviewDecision(
             status=status,
             reason=reason.strip(),
             next_action=next_action.strip(),
             operator_question=str(operator_question or "").strip(),
-            operator_options=normalize_agent_options(
-                option
-                for option in (payload.get("operator_options") or [])
-                if isinstance(option, dict)
-            ),
+            operator_options=normalize_agent_options(option_values),
             checkpoint_recommended=bool(payload.get("checkpoint_recommended", False)),
             research_result=normalize_research_result(
                 payload.get("research_result")
@@ -323,6 +338,10 @@ def decision_from_payload(payload: Mapping[str, Any]) -> ReviewDecision | None:
     )
 
 
+# Compatibility reader, not a prompt schema. Several older sessions emitted
+# frontier/session bookkeeping; accepting it is cheap, but the current prompt
+# only asks for fields that affect settlement, operator routing, research
+# certification, or Manager plan adjudication.
 _VERDICT_KEYS = (
     "STATUS",
     "REASON",
@@ -346,6 +365,44 @@ _VERDICT_KEYS = (
 )
 
 
+def _compact_research_result_blocks(text: str) -> str:
+    """Keep JSON evidence strings out of the line-based control-field reader."""
+    from ..core.role_reply import _line_pattern
+
+    pattern = _line_pattern(("RESEARCH_RESULT",))
+    decoder = json.JSONDecoder()
+    chunks: list[str] = []
+    consumed = offset = 0
+    for line in text.splitlines(keepends=True):
+        start = offset
+        offset += len(line)
+        if start < consumed:
+            continue
+        stripped = line.lstrip(" \t")
+        match = pattern.match(stripped)
+        if match is None:
+            continue
+        body_start = start + len(line) - len(stripped) + match.start("value")
+        while body_start < len(text) and text[body_start].isspace():
+            body_start += 1
+        if text.startswith("```", body_start):
+            fence_end = text.find("\n", body_start)
+            if fence_end < 0:
+                continue
+            body_start = fence_end + 1
+            while body_start < len(text) and text[body_start].isspace():
+                body_start += 1
+        try:
+            payload, end = decoder.raw_decode(text, body_start)
+        except ValueError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        chunks.extend((text[consumed:start], "RESEARCH_RESULT=" + json.dumps(payload)))
+        consumed = end
+    return "".join((*chunks, text[consumed:])) if chunks else text
+
+
 def _parse_named_verdict(text: str) -> ReviewDecision | None:
     """The verdict as stated on named lines, or ``None`` if it was not.
 
@@ -355,11 +412,13 @@ def _parse_named_verdict(text: str) -> ReviewDecision | None:
     answer we could not understand.
     """
     from ..core.role_reply import (
+        decision_footer_text,
         read_block,
         read_key_values,
         read_optional,
     )
 
+    text = _compact_research_result_blocks(text)
     values = read_key_values(text, _VERDICT_KEYS)
     status = str(values.get("STATUS") or "").strip().lower()
     if status not in _STATUSES:
@@ -378,16 +437,19 @@ def _parse_named_verdict(text: str) -> ReviewDecision | None:
     evidence = _tagged_values(read_optional(values, "FRONTIER_EVIDENCE"))
     regression = _tagged_values(read_optional(values, "REGRESSION_ENVELOPE"))
     signal = _tagged_values(read_optional(values, "SESSION_SIGNAL"))
-    research_result = normalize_research_result(
-        _load_json(read_optional(values, "RESEARCH_RESULT"))
-    )
+    raw_research_result = _load_json(read_optional(values, "RESEARCH_RESULT"))
+    if raw_research_result is None:
+        raw_research_result = _load_json(read_block(text, "RESEARCH_RESULT", _VERDICT_KEYS))
+    research_result = normalize_research_result(raw_research_result)
     return _apply_model_judgment_policy(
         ReviewDecision(
             status=status,
             reason=reason.strip()[:5000],
             next_action=read_block(text, "NEXT_ACTION", _VERDICT_KEYS).strip()[:1500],
             operator_question=read_optional(values, "OPERATOR_QUESTION")[:500],
-            operator_options=parse_agent_operator_options(text),
+            operator_options=parse_agent_operator_options(
+                decision_footer_text(text)
+            ),
             checkpoint_recommended=(
                 read_optional(values, "CHECKPOINT_RECOMMENDED").casefold() == "true"
             ),
@@ -453,7 +515,7 @@ def describe_unparsed_verdict(messages: list[str]) -> str:
 
     text = "\n".join(str(m or "") for m in messages).strip()
     if not text:
-        return "Reviewer produced no output to read a verdict from."
+        return "Reviewer produced no output to read a judgment from."
     values = read_key_values(text, _VERDICT_KEYS)
     status = str(values.get("STATUS") or "").strip().lower()
     if not status:
@@ -468,8 +530,8 @@ def describe_unparsed_verdict(messages: list[str]) -> str:
             f"{', '.join(sorted(_STATUSES))}."
         )
     if not read_block(text, "REASON", _VERDICT_KEYS).strip():
-        return f"Reviewer STATUS={status} carried no REASON; a verdict needs one."
-    return "Reviewer output did not contain a valid named verdict footer."
+        return f"Reviewer STATUS={status} carried no REASON; a judgment needs one."
+    return "Reviewer output did not state a readable judgment on its named closing lines."
 
 
 def _find_decision_in_messages(

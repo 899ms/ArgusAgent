@@ -43,35 +43,12 @@ REQUIRE_INDEPENDENT_REVIEW = True
 # counterexamples, and prior results. ``review`` is deliberately excluded: it is
 # independent verification of an argument already in hand, and the Reviewer
 # (which always runs with live search) owns the source checks there.
-ENGINEER_LIVE_SEARCH_STAGES = frozenset({"scope", "solve"})
 
 # Math missions end through the ordinary reviewer-certified final-stage path.
 # They are neither paper-submission missions nor metric-optimization campaigns.
 completion_gate = "none"
 COMPLETION_CONTRACT_VERSION = 1
 PROTECTED_ITEM_IDS = frozenset({"review.goal-achieved"})
-
-# No ``STAGE_CHECKS`` and no ``REVIEWER_CHECKLISTS`` here, deliberately.
-#
-# Both are module-level names several verticals declare, and neither is
-# executed or read by anything in this repository. ``vertical_contract`` picks
-# ``STAGE_CHECKS`` up and stores it, but its only reader is the
-# ``assurance_level`` property, whose only readers are that property's own
-# tests; ``REVIEWER_CHECKLISTS`` is never read at all outside the verticals
-# that copy it from each other. Math's copies were a per-stage shell check that
-# tested for a file the framework had already required, and three paragraphs of
-# review guidance addressed to a Reviewer that never received them.
-#
-# They were removed rather than wired. A name that looks like a gate and is not
-# one is worse than no gate: it answers "is this stage checked?" with a
-# plausible yes, and the run-13 forgery is what happens downstream of a
-# plausible yes. Math's stage checking is ``stage_completion_issues`` below,
-# which core does call, and the Reviewer's per-stage guidance is in
-# ``skills/reviewer/math-research-review.md``, which the Reviewer does read.
-# The one instruction that existed only in the checklist -- establish the
-# problem's known status during ``scope`` rather than leaving each later worker
-# to rediscover it -- was moved into that file before this was deleted.
-
 
 def adopt_operator_objective(project_root: Path, request: str) -> object:
     """Vertical-contract hook: give the objective mode an in-product channel.
@@ -347,7 +324,7 @@ CHECKLIST_ITEMS: dict[str, tuple[ChecklistItem, ...]] = {
                 "It is clear whether success means a proof, counterexample, construction, "
                 "classification, estimate, or honest progress on an open problem. The "
                 "objective mode is recorded, not assumed: `targeted` names one goal to "
-                "prove or refute, `exploratory` names a direction whose deliverable is "
+                "prove or refute, `exploratory` names a direction whose outcome is "
                 "substantive partial results. The two have different completion bars, so "
                 "an unset mode is a scope gap rather than a default."
             ),
@@ -363,7 +340,7 @@ CHECKLIST_ITEMS: dict[str, tuple[ChecklistItem, ...]] = {
                 "and written into the ledger: the results the work will lean on, "
                 "recorded as assumptions with their citations, and the approaches "
                 "already known to fail. Completeness is not the bar and a literature "
-                "survey is not the deliverable. The bar is that the answer exists in "
+                "survey is not what is being asked for. The bar is that the answer exists in "
                 "one place before several workers start, because a search performed "
                 "in scope is paid once and the same search performed in solve is paid "
                 "once per worker. \"Searched and found nothing relevant\" is a "
@@ -409,7 +386,7 @@ CHECKLIST_ITEMS: dict[str, tuple[ChecklistItem, ...]] = {
             statement=(
                 "For a targeted project, the round moved the distance to the goal, not "
                 "merely produced something new. Extending a finite verification to a wider "
-                "range, more moduli, or more primes yields a fresh artifact and no gap "
+                "range, more moduli, or more primes yields a fresh computation and no gap "
                 "reduction; repeating it at a larger bound buys the same information. Say "
                 "which proposition changed status, or that none did. For an exploratory "
                 "project this item is satisfied by a substantive, correctly-scoped result."
@@ -430,7 +407,7 @@ CHECKLIST_ITEMS: dict[str, tuple[ChecklistItem, ...]] = {
                 "achieved. An error-free attempt, correct intermediate lemma, honest partial "
                 "result, or unresolved conclusion is not final-stage completion. A bounded "
                 "subtask may itself be done, but leave this item unsatisfied unless the "
-                "original Goal Gate is achieved."
+                "originally requested goal is achieved."
             ),
             evidence_hint=(
                 "a direct mapping from the requested success criterion to the theorem, "
@@ -534,7 +511,10 @@ def role_banner(role: str) -> str:
     # Manager picks a stage; neither runs Lean, and a host fact they cannot act
     # on is prompt weight spent for nothing.
     if role_name in {"engineer", "reviewer"}:
+        from ...tools.jacobian import jacobian_capability_note
+
         banner += _lean_workspace_note()
+        banner += jacobian_capability_note()
     return banner
 
 
@@ -542,7 +522,6 @@ __all__ = [
     "CHECKLIST_ITEMS",
     "CHECKLIST_STAGE_ORDER",
     "COMPLETION_CONTRACT_VERSION",
-    "ENGINEER_LIVE_SEARCH_STAGES",
     "PROTECTED_ITEM_IDS",
     "REQUIRE_INDEPENDENT_REVIEW",
     "RESEARCH_TARGET_LEVELS",

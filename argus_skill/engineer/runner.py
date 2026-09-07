@@ -1,7 +1,9 @@
 """Reviewer-gated Engineer round orchestration."""
 from __future__ import annotations
 
+import itertools
 import logging
+from dataclasses import replace
 from pathlib import Path
 from typing import Callable
 
@@ -39,7 +41,11 @@ from .round_execution import RoundExecutionMixin
 from .round_prompt import RoundPromptMixin
 from .round_reviewer import RoundReviewerMixin
 from .round_self_review import RoundSelfReviewMixin
-from .round_settlement import RoundSettlementMixin
+from .round_settlement import (
+    RoundSettlementMixin,
+    enforce_question_policy_event,
+    enforce_terminal_question_policy,
+)
 
 # These round-signal helpers remain module attributes because callers and tests
 # patch them through ``argus_skill.engineer.runner``.
@@ -134,11 +140,12 @@ class SupervisedEngineer(
             raw_on_event = on_event
 
             def _redacted_on_event(event: dict) -> None:
+                redacted = redact_secrets_record(
+                    event,
+                    known_values=known_secret_values(),
+                )
                 raw_on_event(
-                    redact_secrets_record(
-                        event,
-                        known_values=known_secret_values(),
-                    )
+                    enforce_question_policy_event(redacted, supervised_config)
                 )
 
             on_event = _redacted_on_event
@@ -150,7 +157,11 @@ class SupervisedEngineer(
             getattr(self.engineer_runner, "backend", type(self.engineer_runner).__name__)
         )
         engineer_policy = effective_role_session_policy(
-            supervised_config.role_session_policy,
+            (
+                "fresh"
+                if supervised_config.engineer_operation == "narrative_edit"
+                else supervised_config.role_session_policy
+            ),
             engineer_backend,
             # Pi deliberately uses --no-session in isolated maintenance
             # worktrees, so no persisted thread may be passed there.
@@ -195,7 +206,37 @@ class SupervisedEngineer(
             ),
             mission_context_path=supervised_config.context_packet_path,
         )
-        for round_index in range(1, supervised_config.max_rounds + 1):
+        if supervised_config.engineer_operation == "narrative_edit":
+            try:
+                from ..core.manuscript_narrative_runtime import (
+                    prepare_narrative_snapshot,
+                )
+
+                snapshot_root = prepare_narrative_snapshot(
+                    workdir,
+                    self.reviewer_config.vertical_state_root or workdir,
+                    mission_id=(
+                        supervised_config.narrative_mission_id
+                        or supervised_config.session_id
+                        or revision
+                    ),
+                )
+                supervised_config = replace(
+                    supervised_config,
+                    narrative_snapshot_root=str(snapshot_root),
+                )
+            except Exception as exc:  # noqa: BLE001 - comparison is a hard contract
+                reason = f"Could not preserve the pre-edit paper snapshot: {exc}"
+                return enforce_terminal_question_policy(
+                    ("error", state.rounds, "", reason, None),
+                    supervised_config,
+                )
+        round_indices = (
+            itertools.count(1)
+            if supervised_config.max_rounds <= 0
+            else range(1, supervised_config.max_rounds + 1)
+        )
+        for round_index in round_indices:
             engineer_resume_id = state.engineer_session.prepare(
                 max_turns=supervised_config.role_session_max_turns,
                 max_input_tokens=supervised_config.role_session_max_input_tokens,
@@ -230,20 +271,29 @@ class SupervisedEngineer(
                 on_event=on_event,
             )
             if control.action == "return":
-                return control.terminal
+                return enforce_terminal_question_policy(
+                    control.terminal,
+                    supervised_config,
+                )
             if control.action == "continue_loop":
                 continue
 
             control = self._handle_agent_driven_wait(
                 round_index=round_index,
                 supervised_config=supervised_config,
-                raw_engineer_message=outcome.raw_engineer_message,
+                raw_engineer_message=(
+                    outcome.engineer_result.last_agent_message
+                    or outcome.raw_engineer_message
+                ),
                 workdir=workdir,
                 state=state,
                 on_event=on_event,
             )
             if control.action == "return":
-                return control.terminal
+                return enforce_terminal_question_policy(
+                    control.terminal,
+                    supervised_config,
+                )
             if control.action == "continue_loop":
                 continue
 
@@ -258,7 +308,10 @@ class SupervisedEngineer(
                 on_event=on_event,
             )
             if control.action == "return":
-                return control.terminal
+                return enforce_terminal_question_policy(
+                    control.terminal,
+                    supervised_config,
+                )
             if control.action == "continue_loop":
                 continue
 
@@ -277,7 +330,10 @@ class SupervisedEngineer(
                 on_event=on_event,
             )
             if control.action == "return":
-                return control.terminal
+                return enforce_terminal_question_policy(
+                    control.terminal,
+                    supervised_config,
+                )
             if control.action == "continue_loop":
                 continue
             review = control.payload
@@ -294,17 +350,25 @@ class SupervisedEngineer(
                 on_event=on_event,
             )
             if control.action == "return":
-                return control.terminal
+                return enforce_terminal_question_policy(
+                    control.terminal,
+                    supervised_config,
+                )
             if control.action == "continue_loop":
                 continue
             # else "proceed": fall through to the next round.
 
-        return (
-            "max_rounds",
-            state.rounds,
-            state.last_engineer_message,
-            f"Hit max_rounds={supervised_config.max_rounds} without reviewer-confirmed completion.",
-            None,
+        # Only an explicit positive max_rounds can exhaust the finite range.
+        return enforce_terminal_question_policy(
+            (
+                "max_rounds",
+                state.rounds,
+                state.last_engineer_message,
+                f"Hit max_rounds={supervised_config.max_rounds} without "
+                "reviewer-confirmed completion.",
+                None,
+            ),
+            supervised_config,
         )
 
     def _run_engineer(
@@ -341,7 +405,8 @@ class SupervisedEngineer(
                     isolate_workdir=self.engineer_config.isolate_workdir,
                     working_dir=str(workdir),
                     live_search=_engineer_live_search(
-                        workdir, self.engineer_config.live_search_stages
+                        self.engineer_config.vertical_state_root or workdir,
+                        self.engineer_config.live_search_stages,
                     ),
                     # Provider/process liveness belongs to the backend's stream
                     # watchdog. Do not infer semantic progress from project

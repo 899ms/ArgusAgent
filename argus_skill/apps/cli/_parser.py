@@ -69,7 +69,6 @@ def _tcp_port(value: str) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     from ... import __version__
-    from ...release import release_manifest
     from ...skills.builtins import DEFAULT_PROJECT_BUILTIN_SKILLS_DIR
 
     parser = _ArgusArgumentParser(
@@ -83,11 +82,10 @@ def build_parser() -> argparse.ArgumentParser:
         # that mis-classifies ``--init`` and exits 2 on Python <= 3.12.
         allow_abbrev=False,
     )
-    release_id = str(release_manifest().get("release_id") or "unknown")
     parser.add_argument(
         "--version",
         action="version",
-        version=f"argus-skill {__version__} ({release_id})",
+        version=f"argus-skill {__version__}",
     )
     parser.add_argument(
         "--update",
@@ -268,10 +266,16 @@ def build_parser() -> argparse.ArgumentParser:
              "waiting",
     )
     cockpit_grp.add_argument(
+        "--ask",
+        metavar="QUESTION",
+        help="answer a one-shot question inline with the Manager and exit; "
+             "nothing is queued and no daemon/--continuous is required",
+    )
+    cockpit_grp.add_argument(
         "--notify-stage",
         default="",
         metavar="STAGE",
-        help="deliver --notify only when the active pipeline reaches this stage "
+        help="deliver --notify only when the running project reaches this stage "
              "(vertical aliases such as profiling→optimize are canonicalized)",
     )
     cockpit_grp.add_argument(
@@ -326,7 +330,7 @@ def build_parser() -> argparse.ArgumentParser:
     capability_grp.add_argument(
         "--setup",
         action="store_true",
-        help="configure and validate an explicit backend/auth mode",
+        help="configure an explicit backend/auth mode and confirm it works",
     )
     capability_grp.add_argument(
         "--doctor",
@@ -369,17 +373,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--auth-mode",
         choices=("subscription_cli", "model_api"),
         default=None,
-        help="authentication contract (model_api is supported with codex)",
+        help="authentication mode (model_api is supported with codex)",
     )
     capability_grp.add_argument(
         "--non-interactive",
         action="store_true",
         help="with --setup: never prompt; requires --backend or --api-url",
-    )
-    capability_grp.add_argument(
-        "--accept-house-rules",
-        action="store_true",
-        help=argparse.SUPPRESS,
     )
     capability_grp.add_argument(
         "--allow-prerelease",
@@ -423,22 +422,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="show the installed PPT Master path, revision, and dependency status",
     )
 
-    maintenance_grp = parser.add_argument_group("self-maintenance")
-    maintenance_grp.add_argument(
-        "--approve-publication",
-        metavar="COMMIT",
-        default="",
-        help="approve pushing a reviewed self-maintenance fix upstream and "
-             "opening its PR. Nothing leaves this machine without it; the fix "
-             "is already reviewed, canaried and live locally. The approval is "
-             "bound to COMMIT and is single-use, so the next fix needs its own",
-    )
-    maintenance_grp.add_argument(
-        "--list-pending-publications",
-        action="store_true",
-        help="list reviewed self-maintenance fixes waiting for approval",
-    )
-
     skills_grp = parser.add_argument_group("skill admin")
     skills_grp.add_argument(
         "--export-builtin-skills",
@@ -460,54 +443,54 @@ def build_parser() -> argparse.ArgumentParser:
         help="override skills directory (default: global skills root)",
     )
 
-    gates_grp = parser.add_argument_group("research-factory gates")
-    gates_grp.add_argument(
+    checks_grp = parser.add_argument_group("research-factory checks")
+    checks_grp.add_argument(
         "--evidence-chain-check",
         action="store_true",
-        help="run F4 evidence-chain validator on a project root and exit; "
+        help="read the F4 evidence chain of a project root and exit; "
              "prints broken chains and exits non-zero if any claim ↔ "
              "evidence ↔ bundle link is broken",
     )
-    gates_grp.add_argument(
+    checks_grp.add_argument(
         "--anti-mediocrity-check",
         action="store_true",
-        help="run F3 anti-mediocrity gates (baseline-reproduction, "
-             "Δ-reward, benchmark-diversity) and exit; requires "
-             "--proposed-condition and --baseline-condition to enable "
-             "the comparison gates",
+        help="run the F3 anti-mediocrity checks (baseline reproduction, "
+             "Δ-reward, benchmark diversity) and exit; the checks that "
+             "compare two conditions also need --proposed-condition and "
+             "--baseline-condition",
     )
-    gates_grp.add_argument(
+    checks_grp.add_argument(
         "--lifecycle-status",
         action="store_true",
         help="print F5 project-lifecycle state derived from project memory "
              "(incubating/running/writing/quarantined/done/archived) and exit",
     )
-    gates_grp.add_argument(
+    checks_grp.add_argument(
         "--lifecycle-resume",
         action="store_true",
         help="resume a quarantined, done, or archived project; restores a "
              "working state in <life-dir>/lifecycle.json so the supervisor "
              "will dispatch missions again",
     )
-    gates_grp.add_argument(
+    checks_grp.add_argument(
         "--lifecycle-archive",
         action="store_true",
         help="archive the project; supervisor will refuse to "
              "dispatch missions until --lifecycle-resume is called",
     )
-    gates_grp.add_argument(
+    checks_grp.add_argument(
         "--project-root",
         default=".",
         help="project root for management commands such as --status when run "
              "outside the workdir, and for evidence/lifecycle checks (default cwd)",
     )
-    gates_grp.add_argument(
+    checks_grp.add_argument(
         "--proposed-condition",
         default=None,
         help="condition name to evaluate against the baseline for "
              "--anti-mediocrity-check",
     )
-    gates_grp.add_argument(
+    checks_grp.add_argument(
         "--baseline-condition",
         default=None,
         help="baseline condition name for --anti-mediocrity-check",
@@ -516,7 +499,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command")
     doctor_parser = subparsers.add_parser(
         "doctor",
-        help="Diagnose and repair Argus with an installed Code Agent",
+        help="Diagnose Argus; repairs require an explicit option",
     )
     doctor_parser.add_argument(
         "--json",
@@ -541,8 +524,8 @@ def build_parser() -> argparse.ArgumentParser:
     doctor_parser.add_argument(
         "--advisor",
         choices=("auto", "none", *SUPPORTED_BACKENDS),
-        default="auto",
-        help="ask an installed Code Agent to inspect and repair Argus (default: auto)",
+        default="none",
+        help="explicitly ask an installed Code Agent to inspect and repair Argus (default: none)",
     )
     repair_parser = subparsers.add_parser(
         "repair",

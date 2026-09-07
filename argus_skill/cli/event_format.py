@@ -12,12 +12,15 @@ import shlex
 from typing import Any, Callable
 
 from ..core.event_catalog import EventType, canonical_event_type
+from ..core.operator_messages import uses_cjk
 from ..core.secret_guard import redact_secrets_text
-from ..life.mission_outcome import outcome_dimension_summary
+from ..life.mission_outcome import mission_outcome_class
 
 # Canonical live events with dedicated presentation. Unknown/internal events
-# fall back to ``[event.type]`` so they remain grep-able. ``match.info`` is an
-# intentionally non-persisted matcher diagnostic retained for stderr sinks.
+# fall back to a short plain-English description with the machine name kept in
+# parentheses so they remain grep-able (``[event.type]`` when no description
+# applies). ``match.info`` is an intentionally non-persisted matcher
+# diagnostic retained for stderr sinks.
 _EVENT_ICONS: dict[str, str] = {
     EventType.LOOP_START: "🚀",
     EventType.LOOP_DONE: "🏁",
@@ -32,6 +35,22 @@ _EVENT_ICONS: dict[str, str] = {
     EventType.LIFE_PLANNER_VERDICT: "📋",
     "match.info": "🎯",
 }
+
+# Plain-English descriptions for event families that have no dedicated
+# renderer. The machine name rides along in parentheses so operators can still
+# grep the logs for it.
+_UNKNOWN_EVENT_FAMILIES: tuple[tuple[str, str], ...] = (
+    ("life.", "an update from the project"),
+    ("round.", "an update from the current round"),
+    ("team.", "an update from the team"),
+)
+
+
+def _describe_unknown_event(kind: str) -> str:
+    for prefix, description in _UNKNOWN_EVENT_FAMILIES:
+        if kind.startswith(prefix):
+            return f"{description} ({kind})"
+    return f"[{kind}]"
 
 
 def _truncate_display(text: str, limit: int) -> str:
@@ -225,14 +244,19 @@ def format_event_message(event: dict[str, Any]) -> str:
     if renderer is not None:
         body = renderer(event)
         if not body:
-            return icon or f"[{kind}]"
+            return icon or _describe_unknown_event(kind)
         return f"{icon} {body}".lstrip()
 
     text = str(event.get("text", "")).strip()
     if not text:
-        return icon or f"[{kind}]"
+        return icon or _describe_unknown_event(kind)
     text = _trunc(text, 300 if icon else 200)
-    return f"{icon} {text}".lstrip() if icon else f"[{kind}] {text}"
+    if icon:
+        return f"{icon} {text}"
+    label = _describe_unknown_event(kind)
+    if label.startswith("["):
+        return f"{label} {text}"
+    return f"{label}: {text}"
 
 
 # ---------------------------------------------------------------------------
@@ -256,10 +280,12 @@ def _render_loop_start(event: dict[str, Any]) -> str:
     objective = _trunc(str(event.get("objective") or ""), 120)
     if objective:
         details = []
-        if event.get("max_rounds") is not None:
-            details.append(f"max_rounds={event['max_rounds']}")
+        max_rounds = event.get("max_rounds")
+        if max_rounds is not None:
+            noun = "round" if max_rounds == 1 else "rounds"
+            details.append(f"up to {max_rounds} {noun}")
         if event.get("plan_mode"):
-            details.append(f"plan_mode={event['plan_mode']}")
+            details.append(f"planning mode {event['plan_mode']}")
         suffix = f" — {', '.join(details)}" if details else ""
         return f"task: {objective}{suffix}"
 
@@ -283,14 +309,12 @@ def _render_round_main_completed(event: dict[str, Any]) -> str:
     fatal = (event.get("fatal_error") or "").strip()
     turn_completed = event.get("turn_completed")
     turn_failed = event.get("turn_failed")
-    flags = []
     if turn_failed:
-        flags.append("turn_failed")
+        head = f"{label}: the Engineer's turn failed before it finished"
     elif turn_completed is False:
-        flags.append("incomplete")
-    head = f"{label}: main agent finished"
-    if flags:
-        head += f" ({', '.join(flags)})"
+        head = f"{label}: the Engineer stopped before finishing the turn"
+    else:
+        head = f"{label}: the Engineer finished this turn"
     body = ""
     if last:
         body = f"\n   ↳ {last}"
@@ -322,8 +346,12 @@ def _render_round_review_completed(event: dict[str, Any]) -> str:
 def _render_loop_done(event: dict[str, Any]) -> str:
     text = str(event.get("text") or "").strip()
     if "success" not in event:
-        return _trunc(text, 200) if text else "loop done"
-    head = "loop done — success" if event.get("success") else "loop done — FAILED"
+        return _trunc(text, 200) if text else "the work here has wrapped up"
+    head = (
+        "the work here ended in success"
+        if event.get("success")
+        else "the work here stopped without success"
+    )
     reason = _trunc(str(event.get("stop_reason") or ""), 400)
     return head + (f"\n   ↳ {reason}" if reason else "")
 
@@ -362,33 +390,69 @@ def _render_engineer_progress(event: dict[str, Any]) -> str:
 def _render_life_mission_started(event: dict[str, Any]) -> str:
     title = (event.get("title") or event.get("objective") or "").strip()
     if title:
-        return f"mission start — {_trunc(title, 100)}"
-    return "mission start"
+        return f"Starting: {_trunc(title, 100)}"
+    return "Starting the next piece of work."
 
 
 def _render_life_mission_completed(event: dict[str, Any]) -> str:
-    parts: list[str] = []
-    status = event.get("status")
-    if status:
-        parts.append(f"status={status}")
+    title = str(event.get("title") or event.get("objective") or "current task").strip()
+    summary = str(
+        event.get("summary")
+        or event.get("stop_reason")
+        or event.get("failure_reason")
+        or event.get("reason")
+        or ""
+    ).strip()
+    status = str(event.get("status") or "").strip().lower()
+    success = event.get("success") is True
+    outcome_class = str(event.get("outcome_class") or "").strip().lower()
+    if not outcome_class:
+        outcome_class = mission_outcome_class(status, success)
+    outcome = event.get("outcome")
+    resumable = bool(event.get("resumable") or event.get("recoverable"))
+    if isinstance(outcome, dict):
+        resumable = resumable or outcome.get("resumable") is True
+    chinese = uses_cjk(f"{title}\n{summary}")
+    if success or outcome_class == "completed":
+        headline = f"已完成：{title}。" if chinese else f"Completed: {title}."
+    elif status.startswith("paused_") or resumable:
+        headline = f"已暂停：{title}。" if chinese else f"Paused: {title}."
+    elif outcome_class == "failed":
+        headline = f"未能完成 {title}。" if chinese else f"Could not complete {title}."
+    else:
+        headline = (
+            f"仍有工作未完成：{title}。"
+            if chinese
+            else f"Work remains on {title}."
+        )
+    if summary:
+        headline += f" {summary}"
+
+    metrics: list[str] = []
     rounds = event.get("rounds")
     if rounds is not None:
-        parts.append(f"rounds={rounds}")
-    elapsed = event.get("elapsed_seconds") or event.get("elapsed_s")
+        metrics.append(
+            f"{rounds} 轮"
+            if chinese
+            else f"{rounds} round{'s' if rounds != 1 else ''}"
+        )
+    elapsed = event.get("elapsed_seconds")
+    if elapsed is None:
+        elapsed = event.get("elapsed_s")
     if elapsed is not None:
-        parts.append(f"elapsed={float(elapsed):.1f}s")
+        metrics.append(
+            f"{float(elapsed):.1f} 秒" if chinese else f"{float(elapsed):.1f}s"
+        )
     cost = event.get("cost_usd")
     pricing_status = str(event.get("pricing_status") or "")
     if cost is not None:
         suffix = "+" if pricing_status in {"partial", "unpriced"} else ""
-        parts.append(f"cost=${float(cost):.4f}{suffix}")
+        cost_text = f"${float(cost):.4f}{suffix}"
+        metrics.append(f"成本 {cost_text}" if chinese else f"cost {cost_text}")
     elif pricing_status in {"partial", "unpriced"}:
-        parts.append(f"cost={pricing_status}")
-    parts.extend(outcome_dimension_summary(event.get("outcome")))
-    if not parts:
-        text = _trunc(str(event.get("text") or ""), 200)
-        return text or "mission complete"
-    return "mission complete  ·  " + "  ·  ".join(parts)
+        cost_text = "部分可用" if chinese else pricing_status
+        metrics.append(f"成本 {cost_text}" if chinese else f"cost {cost_text}")
+    return headline + ("\n" + " · ".join(metrics) if metrics else "")
 
 
 _RICH_RENDERERS: dict[str, Callable[[dict[str, Any]], str]] = {

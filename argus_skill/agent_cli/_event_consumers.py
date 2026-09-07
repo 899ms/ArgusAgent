@@ -6,14 +6,75 @@ appended assistant message text. Extracted verbatim from ``agent_cli_runner.py``
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 
 from .runner_backend import (
     BACKEND_COPILOT,
+    BACKEND_CURSOR,
+    BACKEND_DSH,
     BACKEND_GROK,
     BACKEND_OPENCODE,
     BACKEND_PI,
     CLAUDE_FAMILY,
 )
+
+
+@dataclass
+class _OpenCodeWriteState:
+    """Per-run write-side accumulator for the OpenCode event consumer.
+
+    ``open_index`` is the ``agent_messages`` slot of the assistant reply
+    currently streaming (``None`` between steps). OpenCode emits text as
+    streaming deltas, so the consumer accumulates consecutive deltas into that
+    one slot instead of the old one-element-per-chunk behaviour — that old
+    behaviour is what let a Planner footer spanning several chunks lose all but
+    its last chunk. ``_run_exec.py`` threads one instance per turn so a reply is
+    assembled on the write side and the reader keeps reading ``[-1]``.
+    """
+
+    open_index: int | None = None
+
+
+def _append_opencode_text(
+    agent_messages: list[str],
+    write_state: _OpenCodeWriteState,
+    text: str,
+) -> None:
+    """Accumulate one OpenCode text delta into the streaming reply element.
+
+    Deltas keep their own surrounding whitespace so a reply that is split
+    across chunks (``"Hello "`` then ``"world"``) reassembles to ``"Hello
+    world"`` rather than ``"Helloworld"``: only ``_close_opencode_text``
+    strips, once the whole element is final. Whitespace-only deltas never
+    start a fresh element, so a step that emits nothing does not leave an
+    empty row behind.
+    """
+    if not text:
+        return
+    index = write_state.open_index
+    if index is None or not (0 <= index < len(agent_messages)):
+        if not text.strip():
+            return
+        agent_messages.append(text)
+        write_state.open_index = len(agent_messages) - 1
+    else:
+        agent_messages[index] += text
+
+
+def _close_opencode_text(
+    agent_messages: list[str],
+    write_state: _OpenCodeWriteState,
+) -> None:
+    """Finalize the streaming reply: trim it and drop whitespace-only steps."""
+    index = write_state.open_index
+    if index is None or not (0 <= index < len(agent_messages)):
+        return
+    stripped = agent_messages[index].strip()
+    if stripped:
+        agent_messages[index] = stripped
+    else:
+        del agent_messages[index]
+    write_state.open_index = None
 
 
 class EventConsumerMixin:
@@ -110,6 +171,52 @@ class EventConsumerMixin:
             stack.extend(value.values())
         return False
 
+    def _event_ends_provider_turn(self, event: dict) -> bool:
+        """True when this event marks the end of ONE provider request.
+
+        A "provider turn" here is one request/response round trip inside a
+        single CLI call — the unit the CLI resends the whole transcript for,
+        and therefore the unit the per-call allowance counts. Each dialect
+        exposes a different receipt for it:
+
+        - copilot: ``model.call_finished`` fires once per model request
+          (verified against a persisted engineer call: 43 of them).
+        - claude family / cursor / grok: one ``assistant`` frame per assistant
+          message, carrying that request's ``message.usage``.
+        - opencode: one ``step_finish`` per step (reason ``tool-calls`` for the
+          intermediate rounds, ``stop`` for the last).
+        - pi: one assistant ``message_end`` per provider turn.
+        - codex: one ``item.completed`` per settled item; the reasoning item
+          rides along with the same response as the message/tool item, so only
+          non-reasoning items count.
+        - dsh: no per-turn events at all, so nothing ever counts (its calls
+          stay bounded by the wall-clock and idle watchdogs instead).
+        """
+        event_type = str(event.get("type") or "").strip()
+        if self.backend == BACKEND_COPILOT:
+            return event_type == "model.call_finished"
+        if self.backend in CLAUDE_FAMILY or self.backend in (
+            BACKEND_CURSOR,
+            BACKEND_GROK,
+        ):
+            return event_type == "assistant"
+        if self.backend == BACKEND_OPENCODE:
+            return event_type == "step_finish"
+        if self.backend == BACKEND_PI:
+            if event_type != "message_end":
+                return False
+            message = event.get("message")
+            return (
+                isinstance(message, dict)
+                and str(message.get("role") or "").strip() == "assistant"
+            )
+        if self.backend == BACKEND_DSH:
+            return False
+        if event_type != "item.completed":
+            return False
+        item = event.get("item")
+        return isinstance(item, dict) and str(item.get("type") or "") != "reasoning"
+
     def _consume_event(
         self,
         *,
@@ -119,6 +226,7 @@ class EventConsumerMixin:
         turn_completed: bool,
         turn_failed: bool,
         fatal_error: str | None,
+        write_state: _OpenCodeWriteState | None = None,
     ) -> tuple[str | None, bool, bool, str | None]:
         if self.backend in CLAUDE_FAMILY:
             # qoder emits the same stream-json schema as claude.
@@ -139,6 +247,18 @@ class EventConsumerMixin:
                 turn_failed=turn_failed,
                 fatal_error=fatal_error,
             )
+        if self.backend == BACKEND_CURSOR:
+            state = self._consume_claude_event(
+                event=event,
+                thread_id=thread_id,
+                agent_messages=agent_messages,
+                turn_completed=turn_completed,
+                turn_failed=turn_failed,
+                fatal_error=fatal_error,
+            )
+            if isinstance(state[3], str) and state[3].startswith("Claude runner reported "):
+                state = (*state[:3], state[3].replace("Claude runner", "Cursor CLI", 1))
+            return state
         if self.backend == BACKEND_COPILOT:
             return self._consume_copilot_event(
                 event=event,
@@ -149,10 +269,13 @@ class EventConsumerMixin:
                 fatal_error=fatal_error,
             )
         if self.backend == BACKEND_OPENCODE:
+            if write_state is None:
+                write_state = _OpenCodeWriteState()
             return self._consume_opencode_event(
                 event=event,
                 thread_id=thread_id,
                 agent_messages=agent_messages,
+                write_state=write_state,
                 turn_completed=turn_completed,
                 turn_failed=turn_failed,
                 fatal_error=fatal_error,
@@ -313,6 +436,16 @@ class EventConsumerMixin:
                 agent_messages.append(content.strip())
             return thread_id, turn_completed, turn_failed, fatal_error
 
+        if event_type == "model.response" and isinstance(data, dict):
+            response = data.get("response")
+            response = response if isinstance(response, dict) else {}
+            content = response.get("content")
+            if isinstance(content, str) and content.strip():
+                message = content.strip()
+                if not agent_messages or agent_messages[-1] != message:
+                    agent_messages.append(message)
+            return thread_id, turn_completed, turn_failed, fatal_error
+
         if event_type == "error":
             turn_failed = True
             if fatal_error is None:
@@ -349,6 +482,7 @@ class EventConsumerMixin:
         event: dict,
         thread_id: str | None,
         agent_messages: list[str],
+        write_state: _OpenCodeWriteState,
         turn_completed: bool,
         turn_failed: bool,
         fatal_error: str | None,
@@ -362,11 +496,12 @@ class EventConsumerMixin:
         part = part if isinstance(part, dict) else {}
         if event_type == "text":
             text = part.get("text")
-            if isinstance(text, str) and text.strip():
-                agent_messages.append(text.strip())
+            if isinstance(text, str) and text:
+                _append_opencode_text(agent_messages, write_state, text)
             return thread_id, turn_completed, turn_failed, fatal_error
 
         if event_type == "error":
+            _close_opencode_text(agent_messages, write_state)
             turn_failed = True
             error = event.get("error")
             error = error if isinstance(error, dict) else {}
@@ -380,6 +515,7 @@ class EventConsumerMixin:
         if event_type != "step_finish":
             return thread_id, turn_completed, turn_failed, fatal_error
 
+        _close_opencode_text(agent_messages, write_state)
         reason = str(part.get("reason") or "").strip().lower()
         if reason in {"tool-calls", "tool_calls"}:
             return thread_id, turn_completed, turn_failed, fatal_error

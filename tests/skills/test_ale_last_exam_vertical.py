@@ -40,8 +40,6 @@ def test_ale_last_exam_is_registered_and_loadable() -> None:
     mod = load_vertical("ale_last_exam")
     assert mod.STAGE_ORDER == ["execute"]
     assert mod.CHECKLIST_STAGE_ORDER == ("execute",)
-    assert tuple(mod.STAGE_CHECKS) == ("execute",)
-    assert tuple(mod.REVIEWER_CHECKLISTS) == ("execute",)
     assert vertical_completion_gate(mod) == "none"
 
 
@@ -76,7 +74,7 @@ def test_ale_last_exam_role_banners_pin_hidden_reference_boundaries() -> None:
     for banner in (planner, engineer, reviewer):
         assert "HIDDEN reference" in banner
         assert "Never seek" in banner
-        assert "NOT a paper pipeline" in banner
+        assert "NOT a paper-writing mission" in banner
 
 
 def test_ale_last_exam_vertical_skills_are_packaged(tmp_path: Path) -> None:

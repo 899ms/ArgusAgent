@@ -14,8 +14,10 @@ vocabulary, and three rules that follow from it:
   ``refuted``, someone has to establish that the thing being tested was built
   competently — otherwise the finding is about the code, not the idea.
 * **An under-powered pilot is inconclusive, not negative.** ``statistical_power``
-  sits in the non-idea set: N=1, single-seed, or noise-dominated runs may
-  inform the next probe, but they may not settle the premise.
+  sits in the non-idea set: a noise-dominated run or a toy-sized sample may
+  inform the next probe, but it may not settle the premise. This is about the
+  measurement being drowned in noise, not about repeating runs — a single
+  well-configured run at real scale is normal evidence.
 * **Prior art is a replanning signal, not a refutation.** Finding that an
   existing paper covers the idea changes what to work on next. It is not
   evidence that the premise is false, and recording it as such loses the
@@ -51,7 +53,7 @@ _RESEARCH_ONLY_FAILURES = frozenset(
         "data_access",
         # The evaluator was missing, stubbed, or scoring constants.
         "evaluator_infrastructure",
-        # It ran, but N=1 / single-seed / noise-dominated.
+        # It ran, but the measurement was noise-dominated or toy-sized.
         "statistical_power",
         # A real, adequately-powered measurement. The only thing that can settle
         # the premise either way.
@@ -115,7 +117,7 @@ def validate_idea_evidence(record: dict[str, Any]) -> list[str]:
     if not isinstance(record.get("premise_version"), int):
         errors.append(
             "premise_version must be an integer; bump it when the premise changes "
-            "so an old verdict is not carried onto a new premise"
+            "so an old conclusion is not carried onto a new premise"
         )
     errors.extend(validate_evidence(record, RESEARCH_EVIDENCE))
     return list(dict.fromkeys(errors))
@@ -133,7 +135,7 @@ def template(idea_id: str) -> dict[str, Any]:
         "evaluator_identity": "REPLACE with the evaluator/metric and its revision",
         "comparison_identity": "REPLACE with the baseline or comparison condition",
         "summary": "REPLACE with the concise observed outcome",
-        "evidence": "REPLACE with artifact paths or exact command result",
+        "evidence": "REPLACE with supporting file paths or exact command result",
     }
 
 

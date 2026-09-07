@@ -2,8 +2,8 @@
 set -eu
 
 target="${1:-all}"
-repo="microsoft/ArgusAgent"
-source_url="${ARGUS_INSTALL_SOURCE:-git+https://github.com/microsoft/ArgusAgent.git@main}"
+repo="lbx154/Argus"
+source_url="${ARGUS_INSTALL_SOURCE:-git+https://github.com/lbx154/Argus.git@main}"
 argus_home="${ARGUS_HOME:-$HOME/.local/share/argus}"
 venv="$argus_home/venv"
 python="$venv/bin/python"
