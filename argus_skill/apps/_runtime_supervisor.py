@@ -39,7 +39,8 @@ def _paper_mission_for_project_root(project_root: Path | str) -> bool:
     Missing/corrupt state is deliberately non-paper.  ``resolve_vertical`` has
     a compatibility fallback to ``research`` for undecided projects; using that
     fallback as a mission-type signal caused ordinary bounded tasks to pay for
-    paper idea search and inherit EMNLP guidance. A persisted Manager decision
+    paper idea search and inherit publication-campaign guidance. A persisted
+    Manager decision
     is required here.
     """
     try:
@@ -148,8 +149,8 @@ def _build_supervisor_config(
     open_ended: bool,
 ) -> LifeSupervisorConfig:
     # Mission type follows a positive Manager-authored vertical decision.  An
-    # undecided or malformed project is bounded/non-paper, never implicitly an
-    # EMNLP campaign.
+    # undecided or malformed project is bounded/non-paper, never implicitly a
+    # publication campaign.
     runtime_root = artifact_root or project_root
     paper_mission = _paper_mission_for_project_root(runtime_root)
     final_certification = _final_certification_for_project_root(runtime_root)
@@ -255,6 +256,7 @@ def run_life_supervisor(
                         division.proposed_domain,
                         execution_task=division.execution_task,
                         workflow_mode=division.workflow_mode,
+                        start_stage=division.start_stage,
                     )
                 from ..manager.front_door import require_manager_execution_task
 
@@ -263,14 +265,15 @@ def run_life_supervisor(
                     print(division.headline(), file=sys.stderr)
             except Exception as exc:  # noqa: BLE001 — fail closed, preserve bounded work
                 log.error(
-                    "Manager handoff failed; continuous objective not dispatched: %s",
+                    "Manager front-door decision failed; continuous objective "
+                    "not dispatched: %s",
                     exc,
                 )
                 continuous = False
                 continuous_objective = ""
         refresh_skill_store = getattr(runner, "_refresh_manager_skill_store", None)
         if callable(refresh_skill_store):
-            refresh_skill_store(runner._args)
+            refresh_skill_store(runner._args, workdir=project_worktree)
         cfg = _build_supervisor_config(
             global_daily_cap_usd=global_daily_cap_usd,
             once=once,
@@ -352,8 +355,8 @@ def _invoke_supervisor(
         ns.project_state_dir = None
     # Keep enough room for multi-round implementation and review without
     # allowing one mission to consume an effectively unbounded campaign.
-    # Override via ARGUS_SKILL_MAX_ROUNDS for exceptional long-horizon work.
-    ns.max_rounds = int(os.environ.get("ARGUS_SKILL_MAX_ROUNDS", "32"))
+    # A positive override remains available for explicitly bounded work.
+    ns.max_rounds = int(os.environ.get("ARGUS_SKILL_MAX_ROUNDS", "0"))
 
     # Runtime context injected into every mission prelude so the agent
     # knows its own backend, models, and budget constraints at runtime.
@@ -371,9 +374,10 @@ def _invoke_supervisor(
         f"- Host-global daily budget cap: ${global_daily_cap_usd:.2f}\n"
         f"- Mode: {mode_label}\n"
         f"- Command workdir: {Path.cwd()}\n"
-        f"- Harness artifact root: {_memory_project_root(mem)}\n"
-        "- Keep pipeline/checklist/domain/audit artifacts in the harness artifact "
-        "root; do not reuse stale `research/` state from the command workdir.\n"
+        f"- Harness state root: {_memory_project_root(mem)}\n"
+        "- Keep the run's own working files — stage records, review notes, domain "
+        "files, inspection output — under the harness state root; do not reuse "
+        "stale `research/` state from the command workdir.\n"
     )
     from ..life.research_profile import render_research_profile_context
 

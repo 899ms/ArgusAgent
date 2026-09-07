@@ -13,6 +13,7 @@ from argus_skill.skills.vertical_select import (
 )
 from argus_skill.verticals._base import (
     load_vertical,
+    vertical_role_banner,
     vertical_workflow_mode,
 )
 
@@ -71,12 +72,12 @@ def test_manager_prompt_separates_capability_from_execution_mode() -> None:
         verticals_with_purpose=VERTICAL_PURPOSES,
     )
 
-    assert "capability VERTICAL and independent execution WORKFLOW" in prompt
-    assert "`direct` for one coherent Engineer work package" in prompt
-    assert "coupled output files" in prompt
-    assert "Reviewer is Host-invoked after Engineer" in prompt
+    assert 'VERTICAL and, independently, WORKFLOW' in prompt
+    assert '`direct` for one coherent Engineer task' in prompt
+    assert 'related output files' in prompt
+    assert 'Host invokes Reviewer after Engineer' in prompt
     assert "no task work or Live View" in prompt
-    assert "Omit `execution_task` for a standalone existing route" in prompt
+    assert 'omit it for a standalone existing route' in prompt
 
 
 def test_manager_prompt_routes_short_repair_to_software_direct() -> None:
@@ -86,7 +87,7 @@ def test_manager_prompt_routes_short_repair_to_software_direct() -> None:
     )
 
     assert "software" in prompt
-    assert "`direct` for one coherent Engineer work package" in prompt
+    assert '`direct` for one coherent Engineer task' in prompt
 
 
 def test_direct_reviewer_receives_skill_library_paths(tmp_path) -> None:
@@ -142,5 +143,41 @@ def test_direct_reviewer_uses_contract_not_stage_pipeline(tmp_path) -> None:
     )
 
     assert reviewer.last_prompt_block_stats["stage_checklist"]["chars"] == 0
-    assert "done` closes a bounded direct task" in prompt
+    assert 'done` when a direct task meets its requirements and decisive check' in prompt
     assert "## Upstream defects" not in prompt
+
+
+def test_direct_engineer_and_reviewer_keep_selected_vertical_banners(
+    tmp_path,
+) -> None:
+    from argus_skill.roles.prompts.engineer import build_mission_prompt
+
+    persist_vertical(tmp_path, "kernel_engineering", workflow_mode="direct")
+    vertical = load_vertical("kernel_engineering", project_root=tmp_path)
+    engineer_banner = vertical_role_banner(vertical, "engineer")
+    engineer_prompt = build_mission_prompt(
+        task="Profile one decode and patch the measured hot path.",
+        skill_text="",
+        next_action=None,
+        role_banner=engineer_banner,
+        compact_team=True,
+    )
+    reviewer = Reviewer(runner=None, skill_store=None)
+    reviewer_prompt = reviewer._build_prompt(
+        objective="Profile one decode and patch the measured hot path.",
+        original_objective="Profile one decode and patch the measured hot path.",
+        operator_messages=[],
+        planner_review_instruction="Check correctness and paired throughput.",
+        round_index=1,
+        session_id=None,
+        main_summary="The paired benchmark completed.",
+        main_error=None,
+        working_dir=str(tmp_path),
+        scope="bounded",
+    )
+
+    assert "## Active vertical role" in engineer_prompt
+    assert "Treat unattended benchmark and profiler runs as asynchronous" in (
+        engineer_prompt
+    )
+    assert "never fail work merely because" in reviewer_prompt

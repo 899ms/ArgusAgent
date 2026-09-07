@@ -10,9 +10,9 @@ seeds, and ``run_eval.py`` are FROZEN. HIGHER score is better — it rewards
 problems the solver gets WRONG on the first sample but RIGHT within four
 (calibrated, valid, novel, diverse problems).
 
-Mirrors the metric-MAXIMIZING browsecomp vertical's shape; the stage checks,
-reviewer checklists, role banner, and altitude facts are pinned to the
-pass-gap objective and the editable-pipeline freeze.
+Mirrors the metric-MAXIMIZING browsecomp vertical's shape; the role banner,
+stage checklist, and altitude facts are pinned to the pass-gap objective and
+the editable-pipeline freeze.
 """
 from __future__ import annotations
 
@@ -32,8 +32,6 @@ CHECKLIST_ITEMS = _BASE.checklist_items
 completion_gate = "metric"
 
 STAGE_ORDER = ["setup", "optimize", "measure", "report"]
-
-_PIPELINE_CHECK = ("Pipeline state present", "test -f .argus/PIPELINE_STATE.json")
 
 
 #: The productive, mechanism-CHANGING axes for raising the pass-gap, biggest-
@@ -59,8 +57,8 @@ _CATEGORY_AXES = (
     "than the structural ones above).\n"
     "FROZEN (NEVER edit — doing so INVALIDATES the result): run_eval.py, the "
     "solver (solver.py), verification.py, metrics.py, seeds/heldout data, and the "
-    "fixed reference-solver config. Generate only through the pipeline; never "
-    "hardcode solver answers, read the solver's outputs into generation, or "
+    "fixed reference-solver config. Generate only through the synthesis pipeline; "
+    "never hardcode solver answers, read the solver's outputs into generation, or "
     "special-case the metric."
 )
 
@@ -75,14 +73,14 @@ def role_banner(role: str) -> str:
         "integer-answer (0..999) competition problems CALIBRATED so a FIXED\n"
         "gpt-5.5 solver fails on the first sample but succeeds within four.\n"
         "\n"
-        "EDITABLE — the pipeline only: src/math_synth_bench/baseline.py (entry\n"
+        "EDITABLE — the synthesis pipeline only: src/math_synth_bench/baseline.py (entry\n"
         "point generate(seed, n)->list), configs/pipeline.yaml,\n"
         "prompts/generate_problem.md, and NEW modules under src/math_synth_bench/.\n"
         "FROZEN (touching any INVALIDATES the result): run_eval.py, solver.py,\n"
         "verification.py, metrics.py, the seed/heldout data, and the fixed\n"
         "reference-solver config. Never hardcode solver answers or read the\n"
         "solver's outputs into generation.\n"
-        "FIRST establish the baseline: run the pristine pipeline on the dev split\n"
+        "FIRST establish the baseline: run the pristine synthesis pipeline on the dev split\n"
         "to MEASURE the starting score — do not assume a number. Score ONLY with\n"
         "`python run_eval.py --split dev` (iterate) and `--split test`\n"
         "(held-out, milestone/final). Each candidate must beat the measured\n"
@@ -101,7 +99,7 @@ def role_banner(role: str) -> str:
             "A prompt-only tweak is worth AT MOST one try and rarely moves the "
             "floor; prefer the STRUCTURAL levers (programmatic/parametric "
             "generation, difficulty calibration, validity yield).\n"
-            "NOISE GATE: the dev split is small (10 seeds x 5 = up to 50 candidates "
+            "NOISE FLOOR: the dev split is small (10 seeds x 5 = up to 50 candidates "
             "before filtering), so a small score delta is within run-to-run noise "
             "(the solver is stochastic by design) — do NOT bank a sub-noise gain; "
             "confirm a promising candidate on the test split (or a larger n) before "
@@ -116,10 +114,10 @@ def role_banner(role: str) -> str:
         )
     if role == "engineer":
         return common + (
-            "\nWhen the task is a PIPELINE change OR a CO-DESIGNED BUNDLE, implement "
-            "it FAITHFULLY end-to-end in the editable pipeline — a correct, "
-            "informative REGRESSION is more valuable than a within-noise prompt "
-            "tweak. Keep the freeze inviolate: edit ONLY the pipeline files; keep "
+            "\nWhen the task is a STRUCTURAL generator change OR a CO-DESIGNED BUNDLE, "
+            "implement it FAITHFULLY end-to-end in the editable synthesis pipeline — a "
+            "correct, informative REGRESSION is more valuable than a within-noise prompt "
+            "tweak. Keep the freeze inviolate: edit ONLY the synthesis pipeline's files; keep "
             "the generate(seed, n) entry point; do not modify any frozen file, the "
             "solver, the verification, the metric, or the seeds; never hardcode "
             "solver answers. Iterate on dev; CONFIRM a promising candidate on test "
@@ -144,111 +142,28 @@ def role_banner(role: str) -> str:
             "number.\n"
             "INNOVATION CHECK: the dev split is small and the solver is stochastic, "
             "so a small score gain may be within noise — say so plainly; it must "
-            "NOT be banked without test-split confirmation. Record in the handoff "
-            "that the next candidate should be a structural pipeline change or a "
-            "co-designed bundle, not another prompt nibble. Watch dev/test "
-            "divergence.\n"
+            "NOT be banked without test-split confirmation. Record in the research "
+            "notes that the next candidate should be a structural change to the "
+            "synthesis pipeline or a co-designed bundle, not another prompt nibble. "
+            "Watch dev/test divergence.\n"
         )
     return common
 
 
-STAGE_CHECKS: dict[str, list[tuple[str, str]]] = {
-    "setup": [
-        _PIPELINE_CHECK,
-        ("Mission file present",
-         "test -f MISSION.md || test -f TASK.md"),
-        ("Editable pipeline + frozen runner present",
-         "test -f src/math_synth_bench/baseline.py && test -f run_eval.py"),
-        ("Frozen solver + metric present",
-         "test -f src/math_synth_bench/solver.py && test -f src/math_synth_bench/metrics.py"),
-        ("Setup notes present",
-         "{python} -m argus_skill.verticals.path_evidence --project-root . "
-         "--glob 'mission/SETUP.md' --glob 'SETUP.md' --glob '*SETUP*.md'"),
-        ("GROUND_TRUTH.md exists with content",
-         "test -s research/GROUND_TRUTH.md"),
-    ],
-    "optimize": [
-        _PIPELINE_CHECK,
-        ("At least one attempt scaffolded",
-         "{python} -m argus_skill.verticals.path_evidence --project-root . "
-         "--glob 'attempts/*/baseline.py' --glob 'attempts/*/*.py' "
-         "--glob 'attempts/*/CHANGES.md'"),
-    ],
-    "measure": [
-        _PIPELINE_CHECK,
-        ("At least one scored run recorded (score)",
-         "{python} -m argus_skill.verticals.metric_evidence math-synth --project-root ."),
-    ],
-    "report": [
-        _PIPELINE_CHECK,
-        ("RESULTS present",
-         "test -f RESULTS.md || test -s research/GROUND_TRUTH.md"),
-        ("Report provenance validator passes",
-         "test -f research/report_provenance_validator.py "
-         "&& {python} research/report_provenance_validator.py"),
-    ],
-}
+def stage_completion_issues(stage: str, project_root: Path) -> tuple[str, ...]:
+    from ..metric_evidence import EvidenceError, validate_math_synth_evidence
 
-REVIEWER_CHECKLISTS: dict[str, tuple[str, str, list[str]]] = {
-    "setup": (
-        "engineer/math-synth-data-sota.md",
-        "Evaluate the setup (this stage is a GATE) for a pass-gap MAXIMIZE "
-        "data-synthesis task:\n"
-        "1. The editable pipeline (src/math_synth_bench/baseline.py + configs + "
-        "   prompts) + the FROZEN runner (run_eval.py) + the frozen solver/metric/"
-        "   verification/seeds are present.\n"
-        "2. The FROZEN surface is explicitly recorded: the fixed gpt-5.5 solver "
-        "   config, verification filters, metric, and seeds — the agent edits ONLY "
-        "   the generation pipeline.\n"
-        "3. A REAL baseline run was executed: run_eval.py --split dev on the "
-        "   pristine pipeline reached a MEASURED score, with per-candidate results "
-        "   — proving generate->filter->solve->score works end-to-end.\n"
-        "4. research/GROUND_TRUTH.md names the MEASURED binding failure mode "
-        "   (yield / difficulty-too-low / difficulty-too-high) WITH numbers from "
-        "   that baseline run — re-verify it yourself.\n"
-        "Pass: the frozen surface + a working baseline score + a measured failure "
-        "diagnosis are recorded and the agent can start producing pipeline "
-        "refactors.",
-        ["MISSION.md", "mission/SETUP.md", "research/GROUND_TRUTH.md"],
-    ),
-    "optimize": (
-        "engineer/math-synth-data-sota.md",
-        "Evaluate the latest attempt — FAST loop, keep it LEAN:\n"
-        "1. The change lives ONLY in the editable pipeline; every frozen file "
-        "   (run_eval/solver/verification/metrics/seeds) is byte-identical; the "
-        "   generate() entry point is intact; no hardcoded solver answers. A freeze "
-        "   violation is a DISQUALIFICATION.\n"
-        "2. The change has a stated, testable hypothesis for WHY it raises the "
-        "   pass-gap (which failure mode it fixes) — not a random prompt nibble.\n"
-        "3. CHANGES.md is present and SHORT.\n"
-        "EFFICIENCY: TRUST a clean run of run_eval.py and the score it reports; do "
-        "NOT re-run a recorded score. The metric is score=mean(pass@4-pass@1) on "
-        "dev (higher=better).\n"
-        "Pass: the attempt respects the freeze, its hypothesis is testable, and its "
-        "score is from a clean real run.",
-        ["attempts/", "MISSION.md"],
-    ),
-    "measure": (
-        "engineer/math-synth-data-sota.md",
-        "Evaluate the measurement: the candidate's score on dev from a clean run of "
-        "the frozen run_eval.py, with per-candidate results, AND (for a promotion) "
-        "a test-split run confirming the gain generalizes. The dev split is small "
-        "and the solver stochastic, so a small gain is within noise — a real "
-        "promotion needs the gain to survive on test (or a larger n). Re-derive the "
-        "score yourself from the run artifacts. Pass: rows suffice to compare "
-        "candidate vs baseline honestly.",
-        ["attempts/", "runs/", "MISSION.md"],
-    ),
-    "report": (
-        "engineer/math-synth-data-sota.md",
-        "Evaluate the report: RESULTS.md with one row per attempt sorted by dev "
-        "score, each with its test score when measured, honestly stating which beat "
-        "the measured baseline and whether the gain GENERALIZED to test. No spin; "
-        "flag any dev/test divergence. Pass: the headline score is verifiable from "
-        "the table + the per-run summary.json files.",
-        ["RESULTS.md", "attempts/", "runs/"],
-    ),
-}
+    issues: list[str] = []
+    if stage == "measure":
+        try:
+            validate_math_synth_evidence(project_root)
+        except EvidenceError as exc:
+            issues.append(str(exc))
+    if stage == "report":
+        report = project_root / "RESULTS.md"
+        if not report.is_file() or report.stat().st_size <= 0:
+            issues.append("report requires non-empty RESULTS.md")
+    return tuple(issues)
 
 
 # ---------------------------------------------------------------------------
@@ -422,7 +337,7 @@ def search_altitude_context(project_root: object) -> str:
             ctr.update(set(_name_tokens(t[1])))
         token_hint = ", ".join(f"{k}x{n}" for k, n in ctr.most_common(_ALTITUDE_TOKEN_TOP)) or "(none)"
         return (
-            "## Search altitude — LIVE facts from attempts/ (NO verdict; YOU judge)\n"
+            "## Search altitude — LIVE facts from attempts/ (facts only; YOU judge)\n"
             "Re-surfaced from your OWN attempts/*/summary.json (score=mean(pass@4-"
             "pass@1), HIGHER is better; dev split). Visibility only.\n"
             f"- Scored attempts so far: {len(attempts)}\n"
@@ -442,7 +357,8 @@ def search_altitude_context(project_root: object) -> str:
 
 
 __all__ = [
-    "REVIEWER_CHECKLISTS", "STAGE_CHECKS", "STAGE_ORDER",
+    "STAGE_ORDER",
     "CHECKLIST_STAGE_ORDER", "CHECKLIST_ITEMS",
     "completion_gate", "role_banner", "search_altitude_context",
+    "stage_completion_issues",
 ]

@@ -25,44 +25,6 @@ WORKFLOW_MODE = "direct"
 completion_gate = "none"
 REQUIRE_INDEPENDENT_REVIEW = True
 
-_PIPELINE_CHECK = (
-    "Pipeline state present",
-    "test -f .argus/PIPELINE_STATE.json",
-)
-
-STAGE_CHECKS = {
-    "execute": [
-        _PIPELINE_CHECK,
-        (
-            "Benchmark interface manifest ready",
-            "{python} -m argus_skill.verticals.digital_circuit.evidence "
-            "benchmark-interface --project-root .",
-        ),
-        (
-            "Non-empty generated candidate present",
-            "{python} -m argus_skill.verticals.path_evidence --project-root . "
-            "--glob 'rtl/*.v' --glob 'rtl/*.sv' "
-            "--glob 'dut.py' "
-            "--glob 'reference/*.py' --glob 'reference/*.cc' "
-            "--glob 'reference/*.cpp'",
-        ),
-        (
-            "Pre-score interface/elaboration gate passed",
-            "{python} -m argus_skill.verticals.digital_circuit.evidence "
-            "preflight --project-root .",
-        ),
-        (
-            "Benchmark delivery summary present",
-            "test -s delivery/BENCHMARK_RESULT.md || test -s DELIVERY.md",
-        ),
-        (
-            "Repair artifacts are fresh for the current generation",
-            "{python} -m argus_skill.verticals.digital_circuit.benchmark.stages "
-            "--project-root . --check-repair-freshness",
-        ),
-    ]
-}
-
 REPAIR_FRESHNESS_EVIDENCE = Path("evidence") / "repair_freshness.json"
 
 
@@ -70,7 +32,7 @@ def _preflight_requires_expectation(root: Path) -> bool:
     path = root / "evidence" / "preflight.json"
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError, TypeError):
+    except (OSError, json.JSONDecodeError):
         return False
     if not isinstance(payload, dict):
         return False
@@ -139,6 +101,37 @@ def validate_external_scoring_handoff(
     return evaluate_repair_freshness(root, expectation, evidence)
 
 
+def stage_completion_issues(stage: str, project_root: Path) -> tuple[str, ...]:
+    """Validate the files the fixed-harness scorer needs before execution completes."""
+    if (stage or "").strip().lower() != "execute":
+        return ()
+
+    from ..evidence import (
+        EvidenceError,
+        validate_benchmark_interface,
+        validate_preflight,
+    )
+
+    root = Path(project_root)
+    issues: list[str] = []
+    try:
+        validate_benchmark_interface(root)
+    except EvidenceError as exc:
+        issues.append(str(exc))
+    try:
+        validate_preflight(root)
+    except EvidenceError as exc:
+        issues.append(str(exc))
+
+    summaries = (root / "delivery" / "BENCHMARK_RESULT.md", root / "DELIVERY.md")
+    if not any(path.is_file() and path.stat().st_size > 0 for path in summaries):
+        issues.append(
+            "benchmark delivery requires a non-empty delivery/BENCHMARK_RESULT.md or DELIVERY.md"
+        )
+    issues.extend(validate_external_scoring_handoff(root).issues)
+    return tuple(issues)
+
+
 def _main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--project-root", type=Path, default=Path.cwd())
@@ -177,28 +170,8 @@ def _main(argv: list[str] | None = None) -> int:
     )
     if result.passed:
         return 0
-    print("repair freshness gate failed: " + ", ".join(result.issues))
+    print("repair freshness check failed: " + ", ".join(result.issues))
     return 1
-
-REVIEWER_CHECKLISTS = {
-    "execute": (
-        "reviewer/digital-circuit-benchmark-review.md",
-        "Review one bounded fixed-harness iteration only. Confirm public-context "
-        "closure, exact interface manifest fidelity, non-empty RTL, prompt-derived "
-        "local semantic tests, a passing pre-score elaboration report, hidden/golden "
-        "non-exposure, infrastructure-versus-RTL classification, and an immutable "
-        "attempt handoff. Do not create additional "
-        "specification, synthesis, or delivery missions; this execute node is the "
-        "entire pre-score workflow.",
-        [
-            "design/BENCHMARK_INTERFACE.json",
-            "rtl/",
-            "verification/",
-            "evidence/preflight.json",
-            "delivery/BENCHMARK_RESULT.md",
-        ],
-    )
-}
 
 CHECKLIST_ITEMS = {
     "execute": (
@@ -210,7 +183,7 @@ CHECKLIST_ITEMS = {
                 "latency are frozen before RTL. Ambiguities are recorded; the public "
                 "interface is never silently corrected without an explicit prompt request."
             ),
-            evidence_hint="design/BENCHMARK_INTERFACE.json plus public-context audit",
+            evidence_hint="design/BENCHMARK_INTERFACE.json plus a public-context check",
         ),
         ChecklistItem(
             id="benchmark.rtl-local-gate",
@@ -230,20 +203,20 @@ CHECKLIST_ITEMS = {
                 "The exact expected top module passes Icarus elaboration and the "
                 "precomputed answer mapping matches the public output schema."
             ),
-            evidence_hint="evidence/preflight.json and attempt answer artifact",
+            evidence_hint="evidence/preflight.json and the attempt's answer file",
         ),
         ChecklistItem(
             id="benchmark.integrity-handoff",
             statement=(
-                "The attempt handoff preserves backend/model provenance, hidden/golden "
+                "The attempt's delivered record preserves backend/model provenance, hidden/golden "
                 "non-exposure, iteration identity, and append-only scoring semantics. "
                 "Manager, Planner, Engineer, and independent Reviewer execution is "
                 "recorded for the attempt. Evaluator infrastructure/no-execution records "
                 "do not consume a model attempt number or enter Pass@k denominators. "
                 "A repair additionally proves fresh preflight/regression evidence and "
                 "a mechanically verified answer hash for its current generation. "
-                "No-execution infrastructure failures imply no RTL verdict; an unchanged "
-                "official signature requires a changed public-only hypothesis and test."
+                "No-execution infrastructure failures say nothing about RTL correctness; an "
+                "unchanged official signature requires a changed public-only hypothesis and test."
             ),
             evidence_hint=(
                 "delivery/BENCHMARK_RESULT.md and evidence/repair_freshness.json"
@@ -257,7 +230,7 @@ def role_banner(role: str) -> str:
     return _digital_circuit_role_banner(role) + (
         "\nBENCHMARK SUBVERTICAL: complete the whole pre-score task in ONE bounded "
         "execute mission: public contract closure, RTL, prompt-derived local tests, "
-        "pre-score elaboration, and immutable handoff. Do not create or wait for "
+        "pre-score elaboration, and an immutable record of the attempt. Do not create or wait for "
         "separate specification, RTL, verification, synthesis, or delivery stages. "
         "If `.argus/repair-objective.json` exists, read its generation, iteration, "
         "answer_paths, prior_answer_hash, and created_at. Write fresh preflight JSON "
@@ -276,26 +249,25 @@ def role_banner(role: str) -> str:
         "print(hash_project_files(Path('.'), e.answer_paths))\"`; do not substitute "
         "a plain per-file SHA-256. Preflight "
         "and each regression evidence file must be structured JSON with status=pass "
-        "and matching generation/iteration/repair_mission_id. The gate recomputes "
+        "and matching generation/iteration/repair_mission_id. The freshness check recomputes "
         "all hashes; declarations alone cannot pass. If the categorical signature is "
         "unchanged, also bind public_hypothesis_path/public_hypothesis_hash to a "
         "public-only changed hypothesis with matching generation/iteration/"
         "repair_mission_id, and mark a changed public-only regression. "
-        "A no_execution signature must be infrastructure_only and is not an RTL verdict."
+        "A no_execution signature must be infrastructure_only and says nothing about RTL correctness."
     )
 
 
 __all__ = [
     "CHECKLIST_ITEMS",
     "CHECKLIST_STAGE_ORDER",
-    "REVIEWER_CHECKLISTS",
-    "STAGE_CHECKS",
     "STAGE_ORDER",
     "WORKFLOW_MODE",
     "REQUIRE_INDEPENDENT_REVIEW",
     "completion_gate",
     "prepare_repair_expectation",
     "role_banner",
+    "stage_completion_issues",
     "validate_external_scoring_handoff",
 ]
 

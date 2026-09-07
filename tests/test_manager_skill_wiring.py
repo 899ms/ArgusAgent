@@ -31,7 +31,7 @@ def test_planner_role_skill_moved_to_planner_dir() -> None:
 def test_planner_role_skill_still_loads_from_new_location() -> None:
     # Bare role filenames resolve across bundled role directories.
     text = load_builtin_skill_text("argus-planner-role.md")
-    assert "Argus Planner Role" in text
+    assert "The Planner's role" in text
 
 
 def test_missing_required_role_skill_fails_loudly() -> None:
@@ -49,7 +49,7 @@ def test_planner_role_skill_no_longer_classified_as_engineer() -> None:
 # --------------------------------------------------------------------------
 def test_manager_in_role_subdirs_and_pools() -> None:
     assert "manager" in _ROLE_SUBDIRS
-    assert ROLE_SKILL_POOLS["manager"] == frozenset({"manager"})
+    assert ROLE_SKILL_POOLS["manager"] == frozenset({"manager", "general"})
     # Manager sees every other role's standards as read-only references.
     assert ROLE_CROSS_READ_POOLS["manager"] == frozenset({
         "engineer",
@@ -63,10 +63,11 @@ def test_manager_role_skill_file_exists_and_loads() -> None:
     assert (_BUILTIN_ROOT / "manager" / "argus-manager-role.md").is_file()
     text = load_builtin_skill_text("argus-manager-role.md")
     compact = " ".join(text.split())
-    assert "Argus Manager Role" in text
-    assert "Runtime maintenance must use an isolated worktree" in text
-    assert "controlled canary" in text
-    assert "Publishing that repair is optional" in compact
+    assert "The Manager's role" in text
+    assert "ordinary work supported by evidence and carried out in an isolated worktree" in text
+    assert "Only work the Reviewer finds complete may be considered for deployment" in compact
+    assert "The corresponding Reviewer result is: `done`" in compact
+    assert "deployment requires the operator's approval" in compact
     assert "never automatic" in compact
 
 
@@ -145,9 +146,11 @@ def test_manager_decision_prompt_carries_paths_not_skill_body(
     assert str(store.skills_dir.resolve()) in prompt
     assert "Role: manager" in prompt
     assert "DO NOT PRELOAD THIS MANAGER BODY" not in prompt
-    assert "Argus Manager Role" not in prompt
-    assert "ARGUS_ROLE_DECISION=" in prompt
-    assert '"action":"hold"' in prompt
+    assert "The Manager's role" not in prompt
+    assert "ARGUS_ROLE_DECISION=" not in prompt
+    assert "ACTION=hold" in prompt
+    assert "Right-sidebar presentation" not in prompt
+    assert "LIVE_VIEW_PATHS" not in prompt
     assert decision.action == "hold"
 
 

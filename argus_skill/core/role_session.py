@@ -22,7 +22,7 @@ from .secret_guard import known_secret_values, redact_secrets_text
 
 ROLE_SESSION_POLICIES = frozenset({"auto", "fresh", "mission", "rolling"})
 _RESUMABLE_ROLE_SESSION_BACKENDS = frozenset({
-    "codex", "claude", "copilot", "grok", "opencode", "pi", "qoder",
+    "codex", "claude", "copilot", "cursor", "grok", "opencode", "pi", "qoder",
 })
 _NON_RESUMABLE_ROLE_SESSION_BACKENDS = frozenset({"dsh"})
 ROLE_SESSION_SIGNALS = frozenset({
@@ -84,7 +84,6 @@ def _worktree_branch(workdir: Path) -> str:
             ["git", "-C", str(workdir), "symbolic-ref", "--short", "HEAD"],
             capture_output=True,
             text=True,
-            timeout=5,
             check=False,
         )
     except (OSError, subprocess.SubprocessError):
@@ -144,6 +143,8 @@ class RoleSessionCapsule:
     mission_context_path: str = ""
     thread_id: str = ""
     turns: int = 0
+    # Non-cached input tokens accumulated on the current thread; the rotation
+    # budget in ``prepare`` compares against this, not the raw billed input.
     input_tokens: int = 0
     repository_map: list[str] = field(default_factory=list)
     inspected_paths: list[str] = field(default_factory=list)
@@ -284,7 +285,16 @@ class RoleSessionCapsule:
                 self.turns = 0
                 self.input_tokens = 0
             self.turns += 1
-            self.input_tokens += int(getattr(result, "input_tokens", 0) or 0)
+            # The rotation budget counts only the input the provider actually
+            # had to read fresh. Cached prefix tokens are billed at a small
+            # fraction of the fresh rate and grow with every resumed turn, so
+            # counting them rotated sessions five to ten times too early — and
+            # each rotation discards the provider cache and re-pays the whole
+            # static prompt. A result that reports no cache usage counts in
+            # full, which errs toward rotating sooner rather than later.
+            raw_input = int(getattr(result, "input_tokens", 0) or 0)
+            cached_input = int(getattr(result, "cached_input_tokens", 0) or 0)
+            self.input_tokens += max(0, raw_input - max(0, cached_input))
             self.thread_id = (
                 ""
                 if self.policy == "fresh"

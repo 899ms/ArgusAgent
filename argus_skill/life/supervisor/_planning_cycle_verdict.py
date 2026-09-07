@@ -8,6 +8,7 @@ happens before any waiting/project_done interpretation.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from dataclasses import replace
 from typing import Any
@@ -34,6 +35,23 @@ class PlanningCycleVerdictMixin:
         """Make an exhausted empty plan visible instead of silently backing off."""
         verdict = state.verdict
         reason = str(verdict.reason or verdict.error or "").strip()
+        from ...manager.directive import active_operator_question_policy
+
+        if active_operator_question_policy(self.memory.root) == "forbid":
+            self._emit({
+                "type": EventType.LIFE_PLANNER_ERROR,
+                "cycle": self._planning_cycles,
+                "error": verdict.error or reason,
+                "raw_text": verdict.raw_text,
+                "operator_alert": False,
+                "recoverable": True,
+                "stop_kind": "planner_empty_plan",
+            })
+            self._emit_status(
+                "planner has no concrete task; operator questions are forbidden, "
+                f"so autonomous retry/backoff remains active: {reason[:240]}"
+            )
+            return PLAN_ERROR
         question = (
             "Planner cannot identify a concrete next task. "
             + (f"It reported: {reason[:900]} " if reason else "")
@@ -45,7 +63,7 @@ class PlanningCycleVerdictMixin:
         item_id = str(revision.get("item_id") or "")
         if item_id:
             item = next(
-                (row for row in self.memory.backlog.all() if row.id == item_id),
+                (row for row in self.memory.backlog.history() if row.id == item_id),
                 None,
             )
         if item is None:
@@ -101,15 +119,24 @@ class PlanningCycleVerdictMixin:
         if state.verdict is not None:
             return None
         revision_request = state.revision_request
-        journal_tail = self._render_journal_for_planner()
+        journal_window = self._planner_journal_window()
+        journal_tail = (
+            ""
+            if journal_window is None
+            else self._render_journal_entries_for_planner(journal_window)
+        )
+        journal_delta, journal_window_keys = self._render_journal_delta_for_planner(
+            journal_window
+        )
+        research_plan = self._render_research_plan_for_planner()
+        research_plan_digest = hashlib.sha256(
+            research_plan.encode("utf-8")
+        ).hexdigest()
+        research_plan_unchanged = research_plan_digest == str(
+            getattr(self, "_planner_session_research_plan_digest", "") or ""
+        )
 
         runtime_note = self._planner_runtime_with_idle_note()
-        operator_note = (
-            "LIVE OPERATOR GUIDANCE (supersedes stale blocker state):\n"
-            + "\n".join(f"- {message}" for message in state.operator_messages)
-            if state.operator_messages
-            else ""
-        )
         revision_note = (
             _render_revision_request(revision_request, state.revision_active_items)
             if revision_request is not None
@@ -122,6 +149,18 @@ class PlanningCycleVerdictMixin:
         try:
             from ...planner import Planner
 
+            refresh_skill_store = getattr(
+                self.runner, "_refresh_manager_skill_store", None
+            )
+            runner_args = getattr(self.runner, "_args", None)
+            if callable(refresh_skill_store) and runner_args is not None:
+                refresh_skill_store(
+                    runner_args,
+                    workdir=self._planner_workdir(),
+                )
+            latest_skill_store = getattr(self.runner, "_manager_skill_store", None)
+            if latest_skill_store is not None:
+                self.skill_store = latest_skill_store
             planner = Planner(
                 self.planner_runner,
                 skill_store=self.skill_store,
@@ -137,9 +176,13 @@ class PlanningCycleVerdictMixin:
             if stream_ctx:
                 stream_ctx.__enter__()
             try:
+                state.planner_invoked = True
                 state.verdict = planner.plan_next(
                     continuous_objective=self.config.continuous_objective,
                     journal_tail=journal_tail,
+                    research_plan=research_plan,
+                    journal_delta=journal_delta,
+                    research_plan_unchanged=research_plan_unchanged,
                     planning_cycle=self._planning_cycles - 1,
                     runtime_change_summary="\n\n".join(
                         part
@@ -148,7 +191,6 @@ class PlanningCycleVerdictMixin:
                                 state.manager_intent,
                                 self.config.continuous_objective,
                             ),
-                            operator_note,
                             self._planner_authorization_prompt_block(),
                             stuck_families_note,
                             runtime_note,
@@ -158,6 +200,20 @@ class PlanningCycleVerdictMixin:
                     ),
                     config=self._planner_config(),
                 )
+                self._apply_research_plan_update(
+                    getattr(state.verdict, "raw_text", "") or ""
+                )
+                # The role session (fresh or resumed) has now been shown this
+                # window and this plan, so the next resumed cycle may send only
+                # what settles after them. A backend error leaves the record
+                # untouched: that session rotates, and a rotated session always
+                # receives the full context again.
+                if not getattr(state.verdict, "error", ""):
+                    if journal_window_keys is not None:
+                        self._planner_session_journal_keys = journal_window_keys
+                    self._planner_session_research_plan_digest = (
+                        research_plan_digest
+                    )
             finally:
                 if stream_ctx:
                     stream_ctx.__exit__(None, None, None)
@@ -296,6 +352,14 @@ class PlanningCycleVerdictMixin:
             # a persistently-failing planner cannot spin every poll interval.
             self._enter_idle_backoff()
             return PLAN_ERROR
+
+        for diagnostic in getattr(verdict, "diagnostics", ()):
+            log.warning("planner verdict normalized: %s", diagnostic)
+            self._emit({
+                "type": "life.planner.normalized",
+                "cycle": self._planning_cycles,
+                "diagnostic": str(diagnostic),
+            })
 
         if revision_request is None:
             verdict = self._normalize_live_subagent_wait(verdict)

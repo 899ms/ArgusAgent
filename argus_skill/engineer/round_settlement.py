@@ -4,17 +4,23 @@ from __future__ import annotations
 
 import logging
 import time
+from dataclasses import replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 from ..core.event_catalog import EventType
 from ..core.models import LoopStatus, ReviewDecision, RoundRecord
 from .checkpoint import resolve_shared_checkpoint
+from .round_config import (
+    OPERATOR_QUESTION_FORBIDDEN_NEXT_ACTION,
+    OPERATOR_QUESTION_POLICY_REVIEW_SOURCES,
+)
 from .round_signals import _review_event_payload
 from .round_state import (
     EngineerTurnOutcome,
     RoundControl,
     RoundLoopState,
+    control_continue_loop,
     control_proceed,
     control_return,
 )
@@ -25,6 +31,103 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 
+def _operator_questions_allowed(supervised_config: "SupervisedConfig") -> bool:
+    root = supervised_config.operator_question_policy_root
+    if root is not None:
+        from ..manager.directive import active_operator_question_policy
+
+        return active_operator_question_policy(root) != "forbid"
+    return bool(supervised_config.operator_questions_allowed)
+
+
+def _enforce_operator_question_policy(
+    review: ReviewDecision,
+    *,
+    supervised_config: "SupervisedConfig",
+    state: RoundLoopState,
+) -> ReviewDecision:
+    if _operator_questions_allowed(supervised_config) or not review.operator_question:
+        return review
+    repeated = bool(
+        state.rounds
+        and state.rounds[-1].review.review_source
+        in OPERATOR_QUESTION_POLICY_REVIEW_SOURCES
+    )
+    # ReviewDecision is a plain dataclass, so nothing enforces this field's
+    # type at runtime, and it carries model-derived data into a completion
+    # decision. ``core.models.ReviewDecision.to_event_payload`` guards the same
+    # field for the same reason; the two should not disagree.
+    planner_report = (
+        dict(review.planner_report) if isinstance(review.planner_report, dict) else {}
+    )
+    planner_report.update(
+        {
+            "plan_signal": "continue",
+            "challenge": "",
+            "authority_impact": "technical",
+        }
+    )
+    source = (
+        "engineer_operator_question_policy"
+        if review.review_source == "engineer_operator_question"
+        else "reviewer_operator_question_policy"
+    )
+    return replace(
+        review,
+        status="blocked" if repeated else "continue",
+        reason=(
+            "Operator questions are forbidden and the autonomous continuation did "
+            "not clear the obstacle; state is preserved."
+            if repeated
+            else "Operator questions are forbidden; the obstacle remains owned by "
+            "the autonomous mission."
+        ),
+        next_action="" if repeated else OPERATOR_QUESTION_FORBIDDEN_NEXT_ACTION,
+        operator_question="",
+        operator_options=[],
+        planner_report=planner_report,
+        review_source=source,
+    )
+
+
+def enforce_terminal_question_policy(
+    terminal: tuple,
+    supervised_config: "SupervisedConfig",
+) -> tuple:
+    """Remove forbidden questions from terminal records without losing metadata."""
+    if _operator_questions_allowed(supervised_config):
+        return terminal
+    status, rounds, final_message, reason, thread_id = terminal
+    sanitized = [
+        (
+            replace(
+                record,
+                review=replace(
+                    record.review,
+                    operator_question="",
+                    operator_options=[],
+                ),
+            )
+            if record.review.operator_question
+            else record
+        )
+        for record in rounds
+    ]
+    return status, sanitized, final_message, reason, thread_id
+
+
+def enforce_question_policy_event(
+    event: dict[str, Any],
+    supervised_config: "SupervisedConfig",
+) -> dict[str, Any]:
+    if (
+        not event.get("operator_question")
+        or _operator_questions_allowed(supervised_config)
+    ):
+        return event
+    return {**event, "operator_question": "", "operator_options": []}
+
+
 def _review_forward_progress(review: ReviewDecision) -> bool | None:
     """Return only the Reviewer's explicit structured progress judgment."""
     report = review.planner_report
@@ -32,13 +135,6 @@ def _review_forward_progress(review: ReviewDecision) -> bool | None:
         return None
     value = report.get("forward_progress")
     return value if isinstance(value, bool) else None
-
-
-def _review_plan_signal(review: ReviewDecision) -> str:
-    report = review.planner_report
-    if not isinstance(report, dict):
-        return ""
-    return str(report.get("plan_signal") or "").strip().lower()
 
 
 def _blocked_on_healthy_work(workdir: Path) -> bool:
@@ -108,20 +204,10 @@ class RoundSettlementMixin:
         hard_escalate_rounds: int = 0,
         decision_idle_seconds: float = 0.0,
         decision_timeout_seconds: int = 0,
+        policy_retry: bool = False,
+        soft_limit_stalled: bool = False,
+        soft_round_limit: int = 0,
     ) -> tuple[LoopStatus | None, str]:
-        if _review_plan_signal(review) == "reconsider":
-            report = review.planner_report if isinstance(review.planner_report, dict) else {}
-            challenge = str(report.get("challenge") or review.reason or "").strip()
-            authority = str(report.get("authority_impact") or "technical").strip()
-            if authority == "operator" and review.operator_question:
-                return (
-                    "blocked",
-                    challenge or "The plan challenge requires an operator decision.",
-                )
-            return (
-                "replan_requested",
-                challenge or "Later evidence materially challenged the current plan.",
-            )
         if review.status == "done":
             return "done", review.reason or "Reviewer judged the objective complete."
         if review.status == "blocked":
@@ -133,16 +219,25 @@ class RoundSettlementMixin:
                 "replan_requested",
                 review.reason or "Reviewer requested a Manager-owned replacement plan.",
             )
+        if policy_retry:
+            return None, ""
         if no_progress_streak >= no_progress_threshold:
             return (
                 "no_progress",
                 "Engineer produced no effective output for "
                 f"{no_progress_streak} consecutive rounds." + _STALL_REDIRECT,
             )
+        if soft_limit_stalled:
+            return (
+                "no_progress",
+                f"Soft round limit {soft_round_limit} passed and neither of the "
+                "Reviewer's last two judgments reported forward progress."
+                + _STALL_REDIRECT,
+            )
         if (
             stall_threshold > 0
             and semantic_stall_streak >= stall_threshold
-            and round_index < max_rounds
+            and (max_rounds <= 0 or round_index < max_rounds)
         ):
             return (
                 "no_progress",
@@ -152,7 +247,7 @@ class RoundSettlementMixin:
         if (
             decision_timeout_seconds > 0
             and decision_idle_seconds >= decision_timeout_seconds
-            and round_index < max_rounds
+            and (max_rounds <= 0 or round_index < max_rounds)
         ):
             return (
                 "no_progress",
@@ -187,19 +282,41 @@ class RoundSettlementMixin:
         continue_adaptor,
         on_event: Callable[[dict], None] | None,
     ) -> RoundControl:
+        review = _enforce_operator_question_policy(
+            review,
+            supervised_config=supervised_config,
+            state=state,
+        )
         engineer_result = outcome.engineer_result
         engineer_message = outcome.engineer_message
         state.reviewer_backend_failure_streak = 0
         state.pending_secret_guard_notes.clear()
-        next_semantic_stall_streak, forward_progress = _next_semantic_stall_streak(
-            review,
-            state.semantic_stall_streak,
-            blocked_on_healthy_work=_blocked_on_healthy_work(workdir),
+        policy_retry = bool(
+            review.status == "continue"
+            and review.review_source in OPERATOR_QUESTION_POLICY_REVIEW_SOURCES
         )
+        explicit_forward_progress = _review_forward_progress(review)
+        if policy_retry and explicit_forward_progress is None:
+            next_semantic_stall_streak = state.semantic_stall_streak
+            forward_progress = None
+        else:
+            next_semantic_stall_streak, forward_progress = (
+                _next_semantic_stall_streak(
+                    review,
+                    state.semantic_stall_streak,
+                    blocked_on_healthy_work=_blocked_on_healthy_work(workdir),
+                )
+            )
         now_monotonic = time.monotonic()
         next_decision_progress_at = (
             state.last_decision_progress_at
-            if review.status == "continue" and forward_progress is False
+            if (
+                review.status == "continue"
+                and (
+                    forward_progress is False
+                    or (policy_retry and forward_progress is None)
+                )
+            )
             else now_monotonic
         )
         if on_event:
@@ -229,8 +346,8 @@ class RoundSettlementMixin:
         # declares ``producer_role="reviewer"`` and the supervisor replays it
         # as independent stage evidence, so sealing a self-review here would
         # let the Engineer certify its own stage transition.
-        if supervised_config.context_packet_path and str(
-            getattr(review, "review_source", "reviewer") or "reviewer"
+        if supervised_config.context_packet_path and (
+            review.review_source or "reviewer"
         ) == "reviewer":
             try:
                 from ..life.context_packet import record_reviewed_handoff
@@ -258,7 +375,11 @@ class RoundSettlementMixin:
             0.0,
             now_monotonic - state.last_decision_progress_at,
         )
-        if on_event and state.semantic_stall_streak > 0:
+        if (
+            on_event
+            and state.semantic_stall_streak > 0
+            and not (policy_retry and forward_progress is None)
+        ):
             on_event(
                 {
                     "type": EventType.ROUND_STALL,
@@ -308,6 +429,17 @@ class RoundSettlementMixin:
             hard_escalate_rounds=supervised_config.hard_escalate_rounds,
             decision_idle_seconds=decision_idle_seconds,
             decision_timeout_seconds=(supervised_config.decision_progress_timeout_seconds),
+            policy_retry=policy_retry,
+            soft_limit_stalled=bool(
+                supervised_config.soft_round_limit > 0
+                and round_index > supervised_config.soft_round_limit
+                and len(state.rounds) >= 2
+                and all(
+                    _review_forward_progress(row.review) is not True
+                    for row in state.rounds[-2:]
+                )
+            ),
+            soft_round_limit=supervised_config.soft_round_limit,
         )
         if terminal_status is not None:
             return control_return(
@@ -320,7 +452,10 @@ class RoundSettlementMixin:
                 )
             )
 
-        if continue_adaptor is not None and round_index < supervised_config.max_rounds:
+        if continue_adaptor is not None and (
+            supervised_config.max_rounds <= 0
+            or round_index < supervised_config.max_rounds
+        ):
             try:
                 adapted = str(continue_adaptor(state.rounds) or "").strip()
                 if adapted:
@@ -332,4 +467,6 @@ class RoundSettlementMixin:
                     )
             except Exception:  # noqa: BLE001 — adaptation is advisory
                 log.debug("continue adaptor failed", exc_info=True)
+        if review.review_source in OPERATOR_QUESTION_POLICY_REVIEW_SOURCES:
+            return control_continue_loop()
         return control_proceed()

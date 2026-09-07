@@ -115,6 +115,7 @@ from .handoff import (
 from .state import (
     ContinuousConfigState,
     DaemonStatus,
+    DaemonStopRequest,
     _daemon_log_path,
     _daemon_pid_path,
     _daemon_status_path,
@@ -228,6 +229,10 @@ class LifeWorker(LifeWorkerBootMixin, LifeWorkerRunMixin):
         self._curator: Any = None  # resident teammate-pool Curator (built in run_forever)
         self._control_thread: threading.Thread | None = None
         self._control_started_at_iso = ""
+        self._running_stall_stop = threading.Event()
+        self._running_stall_thread: threading.Thread | None = None
+        self._supervisor_execution_active = threading.Event()
+        self._supervisor_execution_threads: dict[str, threading.Thread] = {}
 
     # -- signal handling ------------------------------------------------
 
@@ -287,7 +292,7 @@ class LifeWorker(LifeWorkerBootMixin, LifeWorkerRunMixin):
         self._control_started_at_iso = started_at_iso
 
         def _watch() -> None:
-            last_request_at = -1.0
+            last_request: DaemonStopRequest | None = None
             # A drain request sets ``_stop`` but deliberately leaves the current
             # mission running. Keep watching so a later operator click can
             # escalate that graceful drain to an immediate, PID-bound interrupt.
@@ -297,8 +302,9 @@ class LifeWorker(LifeWorkerBootMixin, LifeWorkerRunMixin):
                     pid=os.getpid(),
                     started_at_iso=started_at_iso,
                 )
-                if request is not None and request.requested_at != last_request_at:
-                    last_request_at = request.requested_at
+                # A drain and its escalation can share one Windows clock tick.
+                if request is not None and request != last_request:
+                    last_request = request
                     log.info(
                         "daemon: received PID-bound %s request",
                         "drain" if request.drain else "stop",
@@ -330,7 +336,7 @@ class LifeWorker(LifeWorkerBootMixin, LifeWorkerRunMixin):
             project_root=Path(workdir),
             default_width=int(os.environ.get("ARGUS_TEAM_DEFAULT_WIDTH", "8")),
             tick_s=float(os.environ.get("ARGUS_TEAM_CURATOR_TICK_S", "5")),
-            teammate_timeout_s=float(os.environ.get("ARGUS_TEAMMATE_TIMEOUT_S", "5400")),
+            teammate_timeout_s=float(os.environ.get("ARGUS_TEAMMATE_TIMEOUT_S", "0")),
             hard_grace_s=float(os.environ.get("ARGUS_TEAMMATE_HARD_GRACE_S", "600")),
             distill_fn=self._curator_distill_fn(runner),
             distill_interval_s=float(

@@ -14,26 +14,32 @@ actually being spent by a vertical's checklist. Either side could then exhaust
 the other's headroom, and the cheapest way out of a red build was to raise the
 cap — which is how a guard against growth becomes a record of it.
 
-Task-specific content (stage checklist, matched Skills, Wiki, research target,
-objective and operator text) is subtracted out. Those blocks are owned by a
-vertical or by the round and are meant to vary; what must stay compact is the
-role/routing and named-verdict prose this file was written to protect.
+Task-specific content (stage checklist, matched Skills, Wiki, research target)
+is subtracted out. Those blocks are owned by a vertical and are meant to vary;
+what must stay compact is the role/routing and named-verdict prose this file
+was written to protect. The objective, the Planner's guidance, and the operator
+text need no subtraction: they ride in the round delta so the static preamble
+stays byte-identical — and its fingerprint valid — across missions.
 """
 
 from __future__ import annotations
+
+import json
 
 from argus_skill.reviewer import Reviewer
 from argus_skill.roles.prompts import reviewer as reviewer_prompt
 from argus_skill.roles.task_contract import NATIVE_WINDOWS_SHELL_SUMMARY
 
-#: Blocks that belong to a vertical or to the round, not to the fixed contract.
+#: Blocks a vertical owns inside the static preamble, not the fixed contract.
+#: The objective/operator/planner text ("objective_context") is absent here
+#: because it lives in the round delta, outside ``static_total``.
 _TASK_OWNED_BLOCKS = (
     "stage_checklist",
     "matched_skill",
     "direct_memory",
     "wiki_curator",
     "research_target",
-    "objective_context",
+    "surprise_judgment",
 )
 
 # Measured at 4_546 for the representative build. The margin is for one more
@@ -42,7 +48,9 @@ _TASK_OWNED_BLOCKS = (
 # legal `plan_signal` values and the three fields a plan challenge carries.
 # `reconsider` is the only token that opens the Reviewer -> Manager -> Planner
 # channel and it had appeared in no prompt, so deleting that block closes the
-# channel rather than tightening the prose. Re-compress before raising this.
+# channel rather than tightening the prose. Research surprise judgment is
+# measured separately because it applies only to research-result reviews.
+# Re-compress before raising this.
 FIXED_PROSE_BUDGET = 5_000
 
 
@@ -76,6 +84,16 @@ def _prompt(measured: bool, monkeypatch) -> str:
     return _build(measured, monkeypatch)[0]
 
 
+def _persist_research_stage(project_root, stage: str) -> None:
+    from argus_skill.skills.vertical_select import persist_vertical
+
+    persist_vertical(project_root, "research")
+    state_path = project_root / ".argus" / "PIPELINE_STATE.json"
+    payload = json.loads(state_path.read_text(encoding="utf-8"))
+    payload["current_stage"] = stage
+    state_path.write_text(json.dumps(payload), encoding="utf-8")
+
+
 def test_fixed_contract_prose_within_budget(monkeypatch):
     _prompt_text, reviewer = _build(measured=False, monkeypatch=monkeypatch)
     fixed = _fixed_prose_chars(reviewer)
@@ -98,15 +116,14 @@ def test_windows_fixed_contract_prose_within_budget(monkeypatch):
     assert _fixed_prose_chars(reviewer) < FIXED_PROSE_BUDGET
 
 
-def test_reviewer_performs_live_product_acceptance_when_applicable(monkeypatch):
+def test_reviewer_scopes_product_acceptance_to_the_claim(monkeypatch):
     prompt = _prompt(measured=False, monkeypatch=monkeypatch)
 
-    assert "product-user acceptance" in prompt
-    assert "isolated state, non-production port" in prompt
-    assert "test-only credentials" in prompt
+    assert 'Test claimed UI/API/CLI/service flows' in prompt
+    assert 'at a safe public entry point' in prompt
+    assert 'Internal exploration needs its feedback experiment' in prompt
+    assert 'feedback experiment' in prompt
     assert "Never cause external or irreversible effects" in prompt
-    assert "Unit tests alone do not prove that flow" in prompt
-    assert "stop it" in prompt
 
 
 def test_the_budget_ignores_content_a_vertical_owns(monkeypatch):
@@ -142,14 +159,34 @@ def test_compression_removed_redundant_examples(monkeypatch):
     assert "## Evidence policy" not in p
 
 
+def test_ceremonial_frontier_footer_fields_are_not_requested(monkeypatch):
+    prompt = _prompt(measured=False, monkeypatch=monkeypatch)
+
+    for field in (
+        "FRONTIER_CHANGE",
+        "FRONTIER_SUMMARY",
+        "FRONTIER_OBLIGATIONS",
+        "FRONTIER_EVIDENCE",
+        "NEXT_DECISION_POINT",
+        "REGRESSION_ENVELOPE",
+        "SESSION_SIGNAL",
+    ):
+        assert field not in prompt
+
+    # These affect round settlement or Manager plan routing and remain requested.
+    assert "FORWARD_PROGRESS=true" in prompt
+    assert "PLAN_SIGNAL=continue" in prompt
+    assert "plan_alternative" in prompt
+
+
 def test_the_verdict_vocabulary_is_stated_once(monkeypatch):
     # `done`/`continue`/`replan_requested`/`blocked` used to be defined twice —
     # once in the role block and again, at greater length, in the handoff
     # policy. Two definitions of the same four words is the redundancy this
     # budget exists to catch, and it cost more than the sentence it funded.
     p = _prompt(measured=False, monkeypatch=monkeypatch)
-    assert p.count("concrete in-scope material gap") == 1
-    assert p.count("wrong target or real boundary change") == 1
+    assert p.count('one material gap in scope') == 1
+    assert p.count('wrong target or scope change') == 1
 
 
 def test_reviewer_records_prompt_block_token_estimates(monkeypatch):
@@ -172,6 +209,37 @@ def test_reviewer_records_prompt_block_token_estimates(monkeypatch):
     assert stats["main_summary"]["chars"] == len("RESULT: evidence exists")
     assert stats["static_total"]["estimated_tokens"] > 0
     assert stats["static_total"]["chars"] + stats["delta_total"]["chars"] == len(prompt)
+
+
+def test_bounded_review_stage_checklist_stays_compact(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("ARGUS_SKILL_MEASURED_MODE", raising=False)
+    _persist_research_stage(tmp_path, "review")
+    reviewer = Reviewer(runner=None, skill_store=None)
+    prompt = reviewer._build_prompt(
+        objective="bounded submission package repair",
+        operator_messages=[],
+        planner_review_instruction="",
+        round_index=1,
+        session_id=None,
+        main_summary="done",
+        main_error=None,
+        prior_checkpoint={},
+        working_dir=str(tmp_path),
+        scope="bounded",
+    )
+
+    stats = reviewer.last_prompt_block_stats["stage_checklist"]
+    assert stats["chars"] < 10_000
+    assert stats["estimated_tokens"] < 2_500
+    assert "## Stage checklist (review)" in prompt
+    assert "Full pipeline checklist" not in prompt
+    assert "reviewing one task within a larger project" in prompt
+    assert "only the checklist items materially touched by this task" in prompt
+    assert "review.scope" in prompt
+    assert "review.visual" in prompt
 
 
 def test_reviewer_does_not_duplicate_identical_objective(monkeypatch):
@@ -259,13 +327,13 @@ def test_research_target_context_stays_compact(tmp_path, monkeypatch):
     assert stats["estimated_tokens"] < 340
 
 
-def test_reviewer_prompt_records_process_decision_without_final_footer(monkeypatch) -> None:
+def test_reviewer_prompt_uses_a_minimal_prose_footer(monkeypatch) -> None:
     prompt = _prompt(measured=False, monkeypatch=monkeypatch)
 
-    assert "ARGUS_ROLE_DECISION=" in prompt
-    assert '"role":"reviewer"' in prompt
-    assert "Any later response is plain language and is not parsed." in prompt
-    assert "STATUS=done|continue|blocked|replan_requested" not in prompt
+    assert "ARGUS_ROLE_DECISION=" not in prompt
+    assert "Reason naturally" in prompt
+    assert "STATUS=done" in prompt
+    assert "REASON=requested outcome is materially complete" in prompt
     assert "JSON Schema" not in prompt
     assert "OUTPUT CONTRACT (STRICT)" not in prompt
 
@@ -275,7 +343,8 @@ def test_reviewer_accepts_implementation_grounding_proportionally(
 ) -> None:
     prompt = _prompt(measured=False, monkeypatch=monkeypatch)
 
-    assert "primary-source grounding" in prompt
-    assert "community implementations may suffice for implementation details" in prompt
-    assert "`replan_requested` rarely" in prompt
-    assert "Do not demand extra research" in prompt
+    assert 'Use primary sources for external claims' in prompt
+    assert 'community code may ground implementation details' in prompt
+    assert "`replan_requested` for a wrong target" in prompt
+    assert 'Stay within this profile; require no future-proofing' in prompt
+    assert 'require experimental or research feedback' in prompt

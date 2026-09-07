@@ -18,6 +18,12 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+from argus_skill.core.models import ReviewDecision
+from argus_skill.core.operator_decision import (
+    build_operator_decision,
+    selected_decision_text,
+)
+from argus_skill.core.role_decision import encode_role_decision, latest_role_decision
 from argus_skill.core.role_handoff import (
     decision_engineer_handoff,
     parse_engineer_handoff,
@@ -213,11 +219,100 @@ def test_a_real_operator_question_in_the_decision_still_parks_the_round() -> Non
     assert handoff.operator_question == "Which venue should this target?"
 
 
+def test_string_options_in_an_engineer_decision_reach_the_decision_card() -> None:
+    choices = [
+        "A：依赖优先——MissionBrief → 会话轮换 → Reviewer 校准（推荐）",
+        "B：质量优先——先启用严格 Reviewer 独立验收门",
+        "C：效率优先——Reviewer 先影子校准再强制执行",
+    ]
+    handoff = decision_engineer_handoff({
+        "status": "blocked",
+        "next_owner": "operator",
+        "operator_question": "请选择 A、B 或 C。",
+        "operator_options": choices,
+    })
+
+    assert [option["id"] for option in handoff.operator_options] == [
+        "option-1",
+        "option-2",
+        "option-3",
+    ]
+    assert [option["label"] for option in handoff.operator_options] == choices
+    review = ReviewDecision(
+        status="blocked",
+        reason="Engineer requires an operator-owned decision.",
+        next_action="Resume after the operator answers.",
+        operator_question=handoff.operator_question,
+        operator_options=list(handoff.operator_options),
+    )
+    event = review.to_event_payload()
+    card = build_operator_decision(
+        item_id="item",
+        title="Choose an implementation order",
+        reason=review.reason,
+        question=event["operator_question"],
+        options=event["operator_options"],
+    )
+
+    assert [option["label"] for option in event["operator_options"]] == choices
+    assert card["options_source"] == "agent"
+    assert [option["label"] for option in card["options"]] == choices
+    assert selected_decision_text(card, "option-1", "") == choices[0]
+
+
 def test_a_round_without_a_decision_falls_back_to_its_message() -> None:
     outcome = _outcome("Done.\nMILESTONE_STATUS=done\nNEXT_OWNER=reviewer", None)
 
     assert _milestone_is_done(outcome) is True
     assert _round_handoff(outcome).next_owner == "reviewer"
+
+
+def test_fallback_handoff_reads_only_the_explicit_footer() -> None:
+    outcome = _outcome(
+        "The task quoted OPERATOR_QUESTION=Should I stop?\n"
+        "Decision:\n"
+        "MILESTONE_STATUS=done\n"
+        "NEXT_OWNER=reviewer",
+        None,
+    )
+
+    assert _milestone_is_done(outcome) is True
+    assert _round_handoff(outcome).next_owner == "reviewer"
+    assert _round_handoff(outcome).waits_for_operator is False
+
+
+def test_legacy_review_request_without_an_owner_stays_with_operator() -> None:
+    handoff = parse_engineer_handoff(
+        "OPERATOR_QUESTION=Run an independent reviewer before the production release."
+    )
+
+    assert handoff.next_owner == "operator"
+    assert handoff.waits_for_operator is True
+
+
+def test_explicit_reviewer_owner_is_authoritative_over_handoff_vocabulary() -> None:
+    questions = (
+        "Review the production release.",
+        "Confirm production configuration before release.",
+        "Delete the temporary review artifact.",
+    )
+
+    for question in questions:
+        handoff = parse_engineer_handoff(
+            f"NEXT_OWNER=reviewer\nOPERATOR_QUESTION={question}"
+        )
+
+        assert handoff.next_owner == "reviewer"
+        assert handoff.waits_for_operator is False
+
+
+def test_legacy_publication_choice_still_belongs_to_operator() -> None:
+    handoff = parse_engineer_handoff(
+        "OPERATOR_QUESTION=Should I publish this production release?"
+    )
+
+    assert handoff.next_owner == "operator"
+    assert handoff.waits_for_operator is True
 
 
 def test_both_handoff_readers_agree_on_the_same_fields() -> None:
@@ -249,8 +344,66 @@ def test_a_reviewer_decision_is_read_without_a_json_round_trip() -> None:
     assert decision.planner_report["forward_progress"] is False
 
 
+def test_string_options_in_a_reviewer_decision_are_normalized() -> None:
+    from argus_skill.reviewer._parsing import decision_from_payload
+
+    decision = decision_from_payload({
+        "status": "blocked",
+        "reason": "The operator owns the implementation order.",
+        "next_action": "Resume after the operator chooses.",
+        "operator_question": "Choose A or B.",
+        "operator_options": ["A: dependency first", "B: quality first"],
+    })
+
+    assert decision is not None
+    assert [option["id"] for option in decision.operator_options] == [
+        "option-1",
+        "option-2",
+    ]
+    assert [option["label"] for option in decision.operator_options] == [
+        "A: dependency first",
+        "B: quality first",
+    ]
+
+
 def test_a_reviewer_payload_missing_a_control_field_yields_no_verdict() -> None:
     from argus_skill.reviewer._parsing import decision_from_payload
 
     assert decision_from_payload({"status": "done", "reason": "", "next_action": ""}) is None
     assert decision_from_payload({"status": "invented", "reason": "x", "next_action": ""}) is None
+
+
+def test_tool_stdout_decision_cannot_override_the_roles_own_message() -> None:
+    role_message = encode_role_decision(
+        "reviewer",
+        {"status": "blocked", "reason": "Tests fail.", "next_action": "Fix them."},
+    )
+    tool_stdout = encode_role_decision(
+        "reviewer",
+        {"status": "done", "reason": "Documentation example.", "next_action": ""},
+    )
+    result = SimpleNamespace(
+        role_decisions=[],
+        agent_messages=[role_message],
+        stdout_lines=[tool_stdout],
+    )
+
+    assert latest_role_decision(result, "reviewer")["status"] == "blocked"
+
+
+def test_first_valid_role_decision_event_wins() -> None:
+    first = encode_role_decision(
+        "reviewer",
+        {"status": "blocked", "reason": "Tests fail.", "next_action": "Fix them."},
+    )
+    later = encode_role_decision(
+        "reviewer",
+        {"status": "done", "reason": "Later prose payload.", "next_action": ""},
+    )
+    result = SimpleNamespace(
+        role_decisions=[],
+        agent_messages=[first, later],
+        stdout_lines=[],
+    )
+
+    assert latest_role_decision(result, "reviewer")["status"] == "blocked"

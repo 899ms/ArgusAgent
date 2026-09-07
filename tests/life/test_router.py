@@ -76,9 +76,9 @@ def test_route_prompt_has_two_labels_and_safe_default() -> None:
     assert "Argus itself" in p
     assert "Use SELF unless the requested outcome genuinely needs the team" in p
     assert "code/project modification" in p
-    assert "multiple coordinated artifacts" in p
+    assert 'several related outputs' in p
     assert "guided reading/tutoring" in p
-    assert "one low-risk summary/note/report artifact" in p
+    assert 'one low-risk summary, note, or report' in p
 
 
 def test_backend_exception_is_safe_default() -> None:
@@ -132,7 +132,7 @@ def test_build_quick_reply_prompt_never_points_operator_at_the_backend_cli() -> 
 
 def test_build_quick_reply_prompt_includes_identity_when_given() -> None:
     out = build_quick_reply_prompt(objective="who are you", identity_card="I am argus.")
-    assert out.startswith("I am argus.\n\n")
+    assert out.index("You are Argus Manager") < out.index("I am argus.\n\n")
     assert "who are you" in out
 
 
@@ -144,9 +144,11 @@ def test_build_simple_prompt_is_minimal() -> None:
 
     assert f"{runner_backend_label()} worker" in out
     assert "identify only as Argus Manager" in out
-    assert "do not invent extra tasks or artifacts" in out
+    assert 'do not invent extra tasks or outputs' in out
     assert "ask at most one question" in out
     assert "then wait" in out
+    assert "time-by-category cross-slices" in out
+    assert "reread the complete draft once" in out
 
 
 def test_build_simple_prompt_includes_identity_when_given() -> None:
@@ -154,7 +156,7 @@ def test_build_simple_prompt_includes_identity_when_given() -> None:
         objective="are you supervising the daemon?",
         identity_card="Manager operating contract.",
     )
-    assert out.startswith("Manager operating contract.\n\n")
+    assert out.index("You are Argus Manager") < out.index("Manager operating contract.\n\n")
     assert "are you supervising the daemon?" in out
 
 
@@ -177,9 +179,29 @@ def test_build_simple_prompt_omits_mission_status_block_when_empty() -> None:
 def test_build_simple_prompt_includes_mission_status_when_given() -> None:
     status = '## Live mission status\n- item: "demo" (id=abc)'
     out = build_simple_prompt(objective="how's it going?", mission_status=status)
-    assert out.startswith(status + "\n\n")
+    assert out.endswith(status)
     assert "how's it going?" in out
     assert "Argus Manager" in out
+
+
+def test_build_simple_prompt_orders_stable_contract_before_live_context() -> None:
+    status = '## Live mission status\n- item: "demo" (id=abc)'
+    out = build_simple_prompt(
+        objective="how's it going?",
+        identity_card="Manager operating contract.",
+        skill_library="## Manager Skills\nStable library index.",
+        mission_status=status,
+        runtime_context="Runtime fact: warm session.",
+    )
+
+    assert out.index("Answer the request yourself") < out.index(
+        "Lead with the answer in plain language"
+    )
+    assert out.index("Lead with the answer in plain language") < out.index(
+        "## Manager Skills"
+    )
+    assert out.index("## Manager Skills") < out.index("Manager operating contract.")
+    assert out.index("Task:\nhow's it going?") < out.index(status)
 
 
 def test_build_simple_prompt_includes_grounding_workspace_when_given() -> None:

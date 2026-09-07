@@ -100,7 +100,7 @@ def test_engineer_learning_targets_engineer_bucket(tmp_path) -> None:
     )
 
     assert f"Engineer Skill directory (project layer only): {skill_dir}" in prompt
-    assert "Do not add unrelated cleanup or hardening" in prompt
+    assert 'Add no unrelated cleanup, hardening, or substitute outputs' in prompt
     assert "Keep only reusable role learning here" in prompt
     assert "route durable project facts" in prompt
     assert "never write shared/global layers" in prompt
@@ -133,7 +133,7 @@ def test_main_reviewer_never_edits_skills_directly(tmp_path) -> None:
     assert "Reviewer self-evolution" not in control
     assert "Reviewer self-evolution" not in treatment
     assert str((tmp_path / "skills" / "reviewer").resolve()) not in treatment
-    assert "You do not change the work under review" in treatment
+    assert 'Leave sources, outputs, and builds unchanged' in treatment
 
 
 def test_reviewer_protected_resource_evidence_requires_a_traceable_mutation(
@@ -154,11 +154,11 @@ def test_reviewer_protected_resource_evidence_requires_a_traceable_mutation(
         working_dir=tmp_path,
     )
 
-    assert "External identity drift without a mission mutation" in prompt
-    assert "mutation command attributable to this mission" in prompt
+    assert 'Identity drift proves neither failure nor causation' in prompt
+    assert "this mission's mutation command" in prompt
 
 
-def test_planner_learning_ab_switch_targets_planner_bucket(tmp_path, monkeypatch) -> None:
+def test_planner_does_not_write_skills_during_planning(tmp_path, monkeypatch) -> None:
     monkeypatch.chdir(tmp_path)
     store = SkillStore(tmp_path / "skills")
     mission = PlannerMission(store)
@@ -179,8 +179,8 @@ def test_planner_learning_ab_switch_targets_planner_bucket(tmp_path, monkeypatch
     )
 
     assert "Planner self-evolution" not in control
-    assert "Planner self-evolution" in treatment
-    assert str((tmp_path / "skills" / "planner").resolve()) in treatment
+    assert "Planner self-evolution" not in treatment
+    assert str((tmp_path / "skills" / "planner").resolve()) not in treatment
 
 
 def test_the_planner_may_keep_judgement_where_the_engineer_keeps_procedure(

@@ -2,11 +2,10 @@
 
 ## Purpose
 
-Keep decisions grounded in the current public frontier without rerunning the same
-research at every stage. Search when selecting scope, refresh after relevant
-upstream/toolchain changes, repeated mechanism failures, or before a route change,
-and refresh again before an upstream PR/report. Refresh is event-driven, not
-stage- or timer-driven.
+Keep curiosity connected to the current public frontier. Search proactively whenever
+new external mechanisms may expand the plan; do not require a failure, route change,
+stage transition, or timer trigger. Independent mechanism families may be researched
+in parallel. A decision-useful report is a valid result even without implementation.
 
 ## Required search surfaces
 
@@ -38,12 +37,12 @@ repositories, or standards. Record secondary sources only as discovery aids.
 - Search open PRs/issues before coding and immediately before preparing a PR.
 - Use recent windows (30/90/365 days) but retain older canonical mechanisms.
 
-## Evidence artifact
+## Evidence record
 
-Create a fresh snapshot for each real refresh trigger at
+When a durable report is useful, create a fresh snapshot at
 `research/frontier/<stage>.json` and append it with the provided recorder to
 `research/FRONTIER_WATCH.jsonl`. A stage transition alone does not require a new
-snapshot. The JSONL file is append-only audit output; never load it in full.
+snapshot. The JSONL file is an append-only ledger; never load it in full.
 
 ```bash
 python -m argus_skill.verticals.kernel_engineering.frontier_watch template \
@@ -55,11 +54,11 @@ python -m argus_skill.verticals.kernel_engineering.frontier_watch check \
   --project-root . --stage optimize
 ```
 
-Each snapshot must contain concise focused queries, checked surfaces, sources
-that support the decision, material findings and actions, or an explicit
-`no_material_update=true` with a decision-impact explanation. Reviewer judgment,
-not fixed query/source counts, decides whether the evidence is sufficient.
-`frontier_watch check` validates both the current snapshot and its latest
+Each snapshot may contain broad or focused queries, checked surfaces, sourced facts,
+speculative hypotheses, mechanism comparisons, and open questions. It need not end in
+an action, implementation, or immediately verifiable claim. Reviewer judgment, not
+fixed query/source counts, decides whether the exploration is useful.
+`frontier_watch check` checks both the current snapshot and its latest
 same-stage ledger record, so agents and reviewers do not need to read the ledger.
 
 ## Decision discipline
@@ -67,9 +66,10 @@ same-stage ledger record, so agents and reviewers do not need to read the ledger
 - New work does not automatically invalidate measured local evidence. Reproduce
   relevant public results under the project's contract before adopting claims.
 - A new package/release can change environment requirements; refresh the
-  environment audit before using it.
+  recorded environment check before using it.
 - A new upstream PR may make local work duplicative; coordinate, change scope,
   or build on it rather than racing blindly.
 - No material update is a valid result when the search is real and documented.
-- Offline/no-network status is a freshness blocker. Continue local diagnostics
-  if useful, but do not certify the stage or claim the plan is current.
+- Offline/no-network status means freshness cannot be shown. Continue local
+  diagnostics if useful, but do not certify the stage or claim the plan is
+  current.

@@ -37,15 +37,29 @@ def test_shared_manager_grounding_renders_once_for_distinct_task_wording() -> No
     assert "Canonical execution objective." in prompt
 
 
-def test_engineer_prompt_forbids_repeated_checks_and_unbounded_tool_loops() -> None:
+def test_engineer_prompt_avoids_repeated_checks_and_compile_cleanup() -> None:
     prompt = build_mission_prompt(
         task="Audit the repository once.",
         skill_text="",
         next_action=None,
     )
 
-    assert "Never repeat unchanged checks/reads" in prompt
-    assert "never exceed 24" in prompt
+    assert "Never repeat unchanged checks or reads" in prompt
+    assert "Ignore `__pycache__`/`.pyc`" in prompt
+    assert "avoid compile-only ceremony" in prompt
+    assert "never exceed 24" not in prompt
+
+
+def test_engineer_prompt_marks_detail_dependent_operator_options() -> None:
+    prompt = build_mission_prompt(
+        task="Offer the operator implementation choices.",
+        skill_text="",
+        next_action=None,
+    )
+
+    assert "operator_options" in prompt
+    assert "id::true::label::description" in prompt
+    assert "requires_note:true" not in prompt
 
 
 def test_direct_team_prompt_uses_one_mission_contract() -> None:
@@ -61,9 +75,9 @@ def test_direct_team_prompt_uses_one_mission_contract() -> None:
 
     assert prompt.count(marker) == 1
     assert "## Engineer service" in prompt
-    assert "## Engineer receipt" in prompt
+    assert '## Engineer summary' in prompt
     assert "/skills/engineer" in prompt
     assert "## Original operator request" not in prompt
-    assert "FULL_VERTICAL_BANNER_MUST_NOT_REPEAT" not in prompt
+    assert prompt.count("FULL_VERTICAL_BANNER_MUST_NOT_REPEAT") == 1
     assert "## Shared project Wiki" not in prompt
     assert len(prompt) < 3_500

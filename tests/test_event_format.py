@@ -13,6 +13,18 @@ def test_unknown_event_keeps_bracketed_form() -> None:
     assert format_event_message({"type": "custom.event", "text": "x"}) == ("[custom.event] x")
 
 
+def test_unknown_event_families_read_as_prose_with_greppable_name() -> None:
+    assert format_event_message({"type": "life.wiki.collected", "text": "x"}) == (
+        "an update from the project (life.wiki.collected): x"
+    )
+    assert format_event_message({"type": "round.review.deferred"}) == (
+        "an update from the current round (round.review.deferred)"
+    )
+    assert format_event_message({"type": "team.roster.changed", "text": "y"}) == (
+        "an update from the team (team.roster.changed): y"
+    )
+
+
 def test_historical_alias_uses_canonical_loop_renderer() -> None:
     event = {
         "type": "loop.started",
@@ -22,8 +34,10 @@ def test_historical_alias_uses_canonical_loop_renderer() -> None:
     }
     rendered = format_event_message(event)
     assert rendered.startswith("🚀 task: build a CLI")
-    assert "max_rounds=3" in rendered
-    assert "plan_mode=auto" in rendered
+    assert "up to 3 rounds" in rendered
+    assert "planning mode auto" in rendered
+    assert "max_rounds=" not in rendered
+    assert "plan_mode=" not in rendered
 
 
 def test_loop_start_hides_memory_prelude() -> None:
@@ -52,7 +66,7 @@ def test_round_main_completed_shows_output_or_fatal_error() -> None:
             "turn_completed": True,
         }
     )
-    assert "main agent finished" in complete
+    assert "the Engineer finished this turn" in complete
     assert "pytest: 6 passed" in complete
 
     failed = format_event_message(
@@ -63,7 +77,8 @@ def test_round_main_completed_shows_output_or_fatal_error() -> None:
             "fatal_error": "operator stop",
         }
     )
-    assert "turn_failed" in failed
+    assert "the Engineer's turn failed before it finished" in failed
+    assert "turn_failed" not in failed
     assert "operator stop" in failed
 
 
@@ -94,20 +109,30 @@ def test_round_review_completed_renders_verdict_and_next_action() -> None:
 
 
 def test_loop_done_supports_structured_and_text_events() -> None:
-    assert "FAILED" in format_event_message(
+    failed = format_event_message(
         {"type": "loop.completed", "success": False, "stop_reason": "budget"}
+    )
+    assert "the work here stopped without success" in failed
+    assert "budget" in failed
+    assert "FAILED" not in failed
+    assert "the work here ended in success" in format_event_message(
+        {"type": "loop.completed", "success": True}
     )
     assert format_event_message({"type": "loop.done", "text": "review complete"}) == (
         "🏁 review complete"
     )
 
 
-def test_life_mission_completed_renders_dimensions() -> None:
+def test_life_mission_completed_leads_with_outcome_then_metrics() -> None:
     rendered = format_event_message(
         {
             "type": "life.mission.completed",
+            "title": "Repair parser",
             "status": "done",
+            "success": True,
+            "summary": "Empty input now returns a clear error.",
             "rounds": 2,
+            "elapsed_seconds": 3.25,
             "cost_usd": 0.5,
             "outcome": {
                 "execution_status": "completed",
@@ -118,9 +143,11 @@ def test_life_mission_completed_renders_dimensions() -> None:
             },
         }
     )
-    assert "rounds=2" in rendered
-    assert "cost=$0.5000" in rendered
-    assert "execution=completed" in rendered
+    assert "Completed: Repair parser. Empty input now returns a clear error." in rendered
+    assert "2 rounds · 3.2s · cost $0.5000" in rendered
+    assert "rounds=" not in rendered
+    assert "execution=" not in rendered
+    assert "review=" not in rendered
 
 
 def test_match_info_diagnostic_still_renders() -> None:

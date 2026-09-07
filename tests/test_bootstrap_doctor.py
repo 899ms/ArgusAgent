@@ -19,7 +19,7 @@ def test_bootstrap_doctor_runs_without_importing_argus_core() -> None:
         encoding="utf-8",
     )
 
-    assert result.returncode == 0, result.stderr
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
     report = json.loads(result.stdout)
     assert report["schema_version"] == 1
     assert report["mode"] == "bootstrap"
@@ -61,9 +61,9 @@ def test_bootstrap_desktop_runtime_is_advisory_for_cli_web(
         "[project]\nname='argus-skill'\n",
         encoding="utf-8",
     )
-    electron = root / "desktop" / "node_modules" / "electron"
-    electron.mkdir(parents=True)
-    (root / "desktop" / "package.json").write_text("{}\n", encoding="utf-8")
+    desktop = root / "desktop-tauri"
+    desktop.mkdir()
+    (desktop / "package.json").write_text("{}\n", encoding="utf-8")
 
     report = argus_doctor.run_bootstrap_doctor(root)
 

@@ -43,9 +43,9 @@ def _prompt(*, measured: bool, monkeypatch) -> str:
 
 def test_directive_trusts_and_drops_reflexive_rerun():
     d = _verification_directive()
-    assert "Trust clear, consistent evidence" in d
-    assert "missing" in d
-    assert "contradictory" in d
+    assert 'Trust consistent evidence' in d
+    assert 'gaps' in d
+    assert 'contradictions' in d
     assert "identity drift" in d.lower()
     assert "git diff" in d.lower()
     assert "hashes" not in d.lower()
@@ -54,14 +54,18 @@ def test_directive_trusts_and_drops_reflexive_rerun():
     assert "use *your own* output as ground truth" not in d
 
 
-def test_paper_review_requires_built_artifact_quality_checks():
-    block = academic_paper_review_block()
+def test_paper_review_requires_idea_and_built_artifact_quality():
+    block = academic_paper_review_block().lower()
 
-    assert "undefined citations" in block
-    assert "bibliography warnings" in block
-    assert "overfull boxes" in block
-    assert "PDF title/author metadata" in block
-    assert "Render the relevant pages" in block
+    assert "executed code" in block
+    assert "raw rows" in block
+    assert "real evaluator" in block
+    assert "strong same-information baselines" in block
+    assert "positive controls" in block
+    assert "follows the venue's rules" in block
+    assert "rendered layout" in block
+    assert "inside the `reason=` value of your closing lines" in block
+    assert "never reopen selection or move backward" in block
 
 
 def _persist_review_stage(tmp_path, vertical: str) -> None:
@@ -105,7 +109,7 @@ def test_final_certification_review_keeps_paper_review_rubric(tmp_path) -> None:
 
     prompt, reviewer = _project_reviewer_prompt(tmp_path)
 
-    assert "## Near-complete paper review" in prompt
+    assert "## Integrated final paper review" in prompt
     assert reviewer.last_prompt_block_stats["static_total"]["chars"] > 0
 
 
@@ -133,9 +137,24 @@ def test_certified_medical_review_does_not_inherit_paper_policy(tmp_path) -> Non
     assert "## Final paper review" not in prompt
 
 
+def test_final_submission_forces_certify_over_operator_explore(tmp_path) -> None:
+    _persist_review_stage(tmp_path, "research")
+    state_path = tmp_path / ".argus" / "PIPELINE_STATE.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["verification_profile"] = "explore"
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+
+    prompt, _reviewer = _project_reviewer_prompt(
+        tmp_path,
+        scope="final_submission",
+    )
+
+    assert "This round: `certify`" in prompt
+
+
 def test_build_prompt_uses_trust_first_not_old_rerun(monkeypatch):
     p = _prompt(measured=False, monkeypatch=monkeypatch)
-    assert "Trust clear, consistent evidence" in p
+    assert 'Trust consistent evidence' in p
     assert "use *your own* output as ground truth" not in p
     assert "## Evidence policy" not in p
 
@@ -143,34 +162,34 @@ def test_build_prompt_uses_trust_first_not_old_rerun(monkeypatch):
 def test_measured_mode_trusts_scorer_and_refocuses(monkeypatch):
     p = _prompt(measured=True, monkeypatch=monkeypatch)
     assert "TRUST the scorer, judge the IDEA" in p
-    assert "Do NOT re-run the scorer yourself" in p
-    assert "self-supervises correctness" in p
+    assert 'Do not rerun the scorer to confirm an honest, consistent number' in p
+    assert 'Engineer checks correctness by running it every round' in p
     # refocus on novelty judgement + high-level direction
-    assert "genuinely novel" in p
+    assert 'whether this mechanism was new or another adjustment' in p
     # explicit override of the generic demand-evidence rules
-    assert "OVERRIDES the generic" in p
+    assert 'takes precedence over the general rules' in p
 
 
 def test_non_measured_blocks_only_on_claim_critical_evidence(monkeypatch):
     p = _prompt(measured=False, monkeypatch=monkeypatch)
-    assert "Only missing claim-critical evidence means `continue`" in p
-    assert "optional evidence and minor weaknesses stay advisory" in p
+    assert 'Only claim-essential evidence gaps warrant `continue`' in p
+    assert 'optional evidence and minor weaknesses are advice' in p
 
 
-def test_done_is_default_for_materially_complete_outcome(monkeypatch):
+def test_done_tracks_the_current_verification_profile(monkeypatch):
     p = _prompt(measured=False, monkeypatch=monkeypatch)
 
-    assert "Default to `done`" in p
-    assert "not exhaustive proof or artifact completeness" in p
-    assert "Current operator > objective > mission" in p
-    assert "One timeout, failed attempt" in p
+    assert 'outcome meets this verification profile' in p
+    assert 'not exhaustive proof or every file' in p
+    assert 'operator>objective>mission>preregistration' in p
+    assert 'A timeout or failed attempt' in p
 
 
 def test_reviewer_separates_integrity_from_scientific_value(monkeypatch):
     p = _prompt(measured=False, monkeypatch=monkeypatch)
-    assert "Integrity is mandatory" in p
-    assert "not scientific value by itself" in p
-    assert "`replan_requested` rarely" in p
+    assert 'Integrity is required' in p
+    assert 'not scientific value' in p
+    assert "`replan_requested` for a wrong target" in p
 
 
 def test_reviewer_reasons_in_prose_structured_only_at_handoff(monkeypatch):
@@ -180,6 +199,6 @@ def test_reviewer_reasons_in_prose_structured_only_at_handoff(monkeypatch):
     # the property stronger, not weaker: the prose and the verdict now live in
     # the same message instead of the verdict replacing it.
     p = _prompt(measured=False, monkeypatch=monkeypatch)
-    assert "Any later response is plain language" in p
-    assert "ARGUS_ROLE_DECISION=" in p
-    assert '"status":"done"' in p
+    assert "Reason naturally" in p
+    assert "ARGUS_ROLE_DECISION=" not in p
+    assert "STATUS=done" in p

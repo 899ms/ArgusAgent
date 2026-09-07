@@ -4,11 +4,11 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$Repo = "microsoft/ArgusAgent"
+$Repo = "lbx154/Argus"
 $Source = if ($env:ARGUS_INSTALL_SOURCE) {
     $env:ARGUS_INSTALL_SOURCE
 } else {
-    "argus-skill @ https://github.com/microsoft/ArgusAgent/archive/refs/heads/main.zip"
+    "argus-skill @ https://github.com/lbx154/Argus/archive/refs/heads/main.zip"
 }
 
 if (-not (Get-Command py -ErrorAction SilentlyContinue)) {

@@ -30,19 +30,24 @@ from ._env import (
     _incomplete_turn_error,
     _is_manager_turn_label,
     _positive_env_int,
+    _provider_turn_cap,
     _turn_wall_clock_seconds,
 )
+from ._event_consumers import _OpenCodeWriteState
 from ._idle_watchdog import (
     STALLED_STAGE,
     TERMINATE_STAGE,
     WARNING_STAGE,
     IdleEscalation,
 )
+from ._process_control import background_subprocess_kwargs
 from .models import AgentRunResult, InactivitySnapshot
 from .runner_backend import BACKEND_DSH, BACKEND_OPENCODE
 
 _POST_EXIT_PIPE_DRAIN_QUIET_SECONDS = 0.1
+# Post-exit drain bounds retained pipe resources after the provider has exited.
 _POST_EXIT_PIPE_DRAIN_MAX_SECONDS = 5.0
+# This is process-group detach grace, not a role-turn deadline.
 _ORPHAN_GROUP_DETACH_GRACE_SECONDS = 0.5
 
 
@@ -64,9 +69,12 @@ class _StreamState:
     stderr_line_count: int = 0
     json_event_count: int = 0
     agent_messages: list[str] = field(default_factory=list)
+    opencode_write: _OpenCodeWriteState = field(default_factory=_OpenCodeWriteState)
     turn_completed: bool = False
     turn_failed: bool = False
     fatal_error: str | None = None
+    provider_turns: int = 0
+    provider_turn_cap_hit: bool = False
     tool_activity_observed: bool = False
     usage_model: str = ""
     watchdog_terminated: bool = False
@@ -241,8 +249,8 @@ class RunExecMixin:
                 errors="replace",
                 bufsize=1,
                 cwd=options.working_dir or None,
-                env=self._child_env(options),
-                start_new_session=os.name != "nt",
+                env=self._child_env(options, executable=command[0]),
+                **background_subprocess_kwargs(),
             )
         except BaseException:
             if prompt_path is not None:
@@ -307,6 +315,7 @@ class RunExecMixin:
         last_activity_at = time.monotonic()
         turn_started_at = last_activity_at
         turn_wall_clock_seconds = _turn_wall_clock_seconds(run_label)
+        provider_turn_cap = _provider_turn_cap(run_label)
         last_soft_check_at = last_activity_at
         provider_exited_at: float | None = None
         stdout_closed = False
@@ -368,7 +377,10 @@ class RunExecMixin:
                 self._stream_name("stderr", run_label),
                 f"[watchdog] {state.watchdog_reason}",
             )
-            self._terminate_process(process)
+            self._terminate_process(
+                process,
+                include_detached_children=self.backend == BACKEND_OPENCODE,
+            )
             state.watchdog_terminated = True
             return True
 
@@ -395,7 +407,10 @@ class RunExecMixin:
                 self._stream_name("stderr", run_label),
                 f"[watchdog] {state.watchdog_reason}",
             )
-            self._terminate_process(process)
+            self._terminate_process(
+                process,
+                include_detached_children=self.backend == BACKEND_OPENCODE,
+            )
             state.watchdog_terminated = True
             return True
 
@@ -438,7 +453,10 @@ class RunExecMixin:
                 # orphaned and does not keep burning tokens, then re-raise so
                 # the interactive caller can return to its prompt.
                 if process.poll() is None:
-                    self._terminate_process(process)
+                    self._terminate_process(
+                        process,
+                        include_detached_children=self.backend == BACKEND_OPENCODE,
+                    )
                 raise
             except queue.Empty:
                 now = time.monotonic()
@@ -475,7 +493,10 @@ class RunExecMixin:
                             self._stream_name("stderr", run_label),
                             f"[watchdog] {state.watchdog_reason}",
                         )
-                        self._terminate_process(process)
+                        self._terminate_process(
+                            process,
+                            include_detached_children=self.backend == BACKEND_OPENCODE,
+                        )
                         state.watchdog_terminated = True
 
                 last_message_chars = len(state.agent_messages[-1]) if state.agent_messages else 0
@@ -513,7 +534,10 @@ class RunExecMixin:
                             self._stream_name("stderr", run_label),
                             f"[watchdog] {state.watchdog_reason}",
                         )
-                        self._terminate_process(process)
+                        self._terminate_process(
+                            process,
+                            include_detached_children=self.backend == BACKEND_OPENCODE,
+                        )
                         state.watchdog_terminated = True
                 continue
 
@@ -536,6 +560,39 @@ class RunExecMixin:
                 if event is None:
                     continue
                 state.json_event_count += 1
+                if (
+                    provider_turn_cap > 0
+                    and not state.watchdog_terminated
+                    and self._event_ends_provider_turn(event)
+                ):
+                    state.provider_turns += 1
+                    if (
+                        state.provider_turns >= provider_turn_cap
+                        and process.poll() is None
+                    ):
+                        # The allowance is a housekeeping boundary, not an
+                        # error: the caller reads this exact prefix, keeps the
+                        # work, and continues the task in a fresh session with
+                        # the checkpoint and a summary.
+                        state.provider_turn_cap_hit = True
+                        state.watchdog_reason = (
+                            "Provider turn cap reached: this "
+                            f"{run_label or 'agent'} call used "
+                            f"{state.provider_turns} provider turns (allowance "
+                            f"{provider_turn_cap}, ARGUS_SKILL_PROVIDER_TURN_CAP). "
+                            "Each further turn would resend the whole grown "
+                            "transcript; the harness continues this work in a "
+                            "fresh session instead."
+                        )
+                        self._emit(
+                            self._stream_name("stderr", run_label),
+                            f"[watchdog] {state.watchdog_reason}",
+                        )
+                        self._terminate_process(
+                            process,
+                            include_detached_children=self.backend == BACKEND_OPENCODE,
+                        )
+                        state.watchdog_terminated = True
                 if self._event_has_tool_activity(event):
                     state.tool_activity_observed = True
                 observed_model = self._event_usage_model(event)
@@ -544,6 +601,7 @@ class RunExecMixin:
                 if self._retain_json_event(event):
                     state.events.append(event)
                 _msgs_before = len(state.agent_messages)
+                _last_text_before = len(state.agent_messages[-1]) if state.agent_messages else 0
                 (
                     state.thread_id,
                     state.turn_completed,
@@ -556,17 +614,27 @@ class RunExecMixin:
                     turn_completed=state.turn_completed,
                     turn_failed=state.turn_failed,
                     fatal_error=state.fatal_error,
+                    write_state=state.opencode_write,
                 )
                 # Stream each NEW assistant block to the opt-in callback the
                 # instant it lands — this is what lets the Manager chat front-door
                 # render the reply live instead of after the whole turn. Default
                 # ``None`` (every daemon/role turn) skips this entirely, so the
                 # hot path is unchanged. A callback fault must never break the run.
+                # As in the ACP path, the callback receives the accumulated element
+                # (a growing superset), so the UI merges it in place by message_id.
                 _cb = options.on_agent_message
-                if _cb is not None and len(state.agent_messages) > _msgs_before:
-                    for _blk in state.agent_messages[_msgs_before:]:
+                if _cb is not None and state.agent_messages:
+                    _new_count = len(state.agent_messages)
+                    if _new_count > _msgs_before:
+                        for _blk in state.agent_messages[_msgs_before:]:
+                            try:
+                                _cb(_blk)
+                            except Exception:  # noqa: BLE001 — UI callback must not break the turn
+                                pass
+                    elif _new_count == _msgs_before and len(state.agent_messages[-1]) > _last_text_before:
                         try:
-                            _cb(_blk)
+                            _cb(state.agent_messages[-1])
                         except Exception:  # noqa: BLE001 — UI callback must not break the turn
                             pass
             else:
@@ -636,6 +704,7 @@ class RunExecMixin:
                     if self._retain_json_event(event):
                         state.events.append(event)
                     messages_before = len(state.agent_messages)
+                    last_text_before = len(state.agent_messages[-1]) if state.agent_messages else 0
                     (
                         state.thread_id,
                         state.turn_completed,
@@ -645,15 +714,23 @@ class RunExecMixin:
                         event=event,
                         thread_id=state.thread_id,
                         agent_messages=state.agent_messages,
+                        write_state=state.opencode_write,
                         turn_completed=state.turn_completed,
                         turn_failed=state.turn_failed,
                         fatal_error=state.fatal_error,
                     )
                     callback = options.on_agent_message
-                    if callback is not None and len(state.agent_messages) > messages_before:
-                        for message in state.agent_messages[messages_before:]:
+                    if callback is not None and state.agent_messages:
+                        new_count = len(state.agent_messages)
+                        if new_count > messages_before:
+                            for message in state.agent_messages[messages_before:]:
+                                try:
+                                    callback(message)
+                                except Exception:  # noqa: BLE001 — UI callback must not break the turn
+                                    pass
+                        elif new_count == messages_before and len(state.agent_messages[-1]) > last_text_before:
                             try:
-                                callback(message)
+                                callback(state.agent_messages[-1])
                             except Exception:  # noqa: BLE001 — UI callback must not break the turn
                                 pass
 
@@ -725,6 +802,8 @@ class RunExecMixin:
             turn_completed=state.turn_completed,
             turn_failed=state.turn_failed,
             fatal_error=state.fatal_error,
+            provider_turns=state.provider_turns,
+            provider_turn_cap_hit=state.provider_turn_cap_hit,
             tool_activity_observed=state.tool_activity_observed,
             usage_model=state.usage_model,
             orphan_process_group_id=state.orphan_process_group_id,

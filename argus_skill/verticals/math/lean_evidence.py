@@ -286,7 +286,7 @@ def _discover(project_root: Path) -> tuple[tuple[Path, ...], list[LeanIssue]]:
                             "lean_source_external",
                             _display(candidate, root),
                             "Lean source links outside the project, so the "
-                            "evidence cannot be audited with it; keep the "
+                            "evidence cannot be checked against it; keep the "
                             "formal source in the project",
                         )
                     )
@@ -532,9 +532,9 @@ def _schema_problems(result: dict[str, Any], source: Path) -> list[str]:
             )
         if result.get("audit_exit_code") != 0:
             problems.append(
-                "status is success but the environment axiom audit did not "
+                "status is success but the environment axiom check did not "
                 f"report success (audit_exit_code={result.get('audit_exit_code')!r}); "
-                "a proof resting on an unaudited axiom is not a proof"
+                "a proof resting on an unchecked axiom is not a proof"
             )
         if holes:
             problems.append("status is success but proof holes are recorded")
@@ -833,11 +833,11 @@ def _result_issues(
             LeanIssue(
                 "lean_unverified_audit_failed",
                 display,
-                "the file compiled but the environment axiom audit could not "
+                "the file compiled but the environment axiom check could not "
                 "run, so it is unknown whether the proof rests on an axiom. "
-                "This is an environment gap, not a mathematical defect — but an "
-                "unaudited proof is not evidence; re-run the check on a working "
-                "toolchain",
+                "This is an environment gap, not a mathematical defect — but a "
+                "proof whose axioms were never checked is not evidence; re-run "
+                "the check on a working toolchain",
             )
         ]
     if status == "proof_hole":
@@ -884,7 +884,7 @@ def _first_error_line(result: dict[str, Any]) -> str:
 
 def _display(path: Path, project_root: Path) -> str:
     try:
-        return str(path.resolve().relative_to(project_root.resolve()))
+        return path.resolve().relative_to(project_root.resolve()).as_posix()
     except (ValueError, OSError):
         return str(path)
 
@@ -984,7 +984,7 @@ def source_evidence(source: Path | str, project_root: Path | str) -> LeanSourceE
                     "lean_source_external",
                     str(path),
                     f"the Lean source is outside the project root {root}; "
-                    "evidence must cite an artifact the project carries",
+                    "evidence must cite a file the project carries",
                 ),
             ),
         )
@@ -1067,7 +1067,7 @@ def verify_lean_source(
     *,
     statement_fidelity: Path | str,
     artifact_dir: Path | str | None = None,
-    timeout_seconds: float = 30.0,
+    timeout_seconds: float | None = None,
     lean_bin: str | None = None,
     lake_bin: str | None = None,
     use_lake: bool | None = None,
@@ -1238,9 +1238,12 @@ def _add_compile_arguments(parser: argparse.ArgumentParser) -> None:
         "--project-root",
         type=Path,
         default=Path("."),
-        help="the project whose state --claim writes to, and the root artifact paths are recorded against",
+        help="the project whose state --claim writes to, and the root the recorded paths are relative to",
     )
-    parser.add_argument("--timeout", type=float, default=30.0)
+    parser.add_argument(
+        "--timeout", type=float, default=None,
+        help="explicit compile timeout; omitted waits for Lean to finish",
+    )
     parser.add_argument("--lean-bin")
     parser.add_argument("--lake-bin")
     parser.add_argument(
@@ -1290,7 +1293,7 @@ def main(argv: list[str] | None = None) -> int:
                 lake_bin=args.lake_bin,
                 use_lake=args.lake,
             )
-        except (OSError, UnicodeError, ValueError) as exc:
+        except (OSError, ValueError) as exc:
             print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False))
             return 2
         payload = dict(result)
@@ -1333,7 +1336,7 @@ def main(argv: list[str] | None = None) -> int:
                 lake_bin=args.lake_bin,
                 use_lake=args.lake,
             )
-        except (OSError, UnicodeError, ValueError) as exc:
+        except (OSError, ValueError) as exc:
             print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False))
             return 2
         print(json.dumps(started, ensure_ascii=False, indent=2))
@@ -1344,7 +1347,7 @@ def main(argv: list[str] | None = None) -> int:
 
         try:
             payload = reclaim_lean_run(args.handle)
-        except (OSError, UnicodeError, ValueError) as exc:
+        except (OSError, ValueError) as exc:
             print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False))
             return 2
         print(json.dumps(payload, ensure_ascii=False, indent=2))

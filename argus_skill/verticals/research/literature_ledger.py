@@ -270,7 +270,7 @@ def validate_literature_ledger(payload: object) -> list[LiteratureIssue]:
                 LiteratureIssue(
                     "raw_source_missing",
                     path,
-                    "a cached raw source artifact is required",
+                    "a cached copy of the raw source is required",
                 )
             )
         if not _project_relevance(raw):
@@ -396,7 +396,7 @@ def main(argv: list[str] | None = None) -> int:
     root = args.project_root.expanduser().resolve()
     try:
         payload = load_ledger(root)
-    except (OSError, ValueError, json.JSONDecodeError) as exc:
+    except (OSError, ValueError) as exc:
         print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False))
         return 1
     issues = validate_literature_ledger(payload)

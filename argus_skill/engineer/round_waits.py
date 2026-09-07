@@ -13,7 +13,13 @@ from typing import TYPE_CHECKING, Callable
 from ..core import process_stop
 from .external_work import inspect_external_work, parse_external_wait_request
 from .round_signals import _pause_decision_clock
-from .round_state import RoundControl, RoundLoopState, control_continue_loop, control_proceed
+from .round_state import (
+    RoundControl,
+    RoundLoopState,
+    control_continue_loop,
+    control_proceed,
+    control_return,
+)
 
 if TYPE_CHECKING:
     from .runner import SupervisedConfig
@@ -48,27 +54,52 @@ class RoundWaitsMixin:
                 )
             )
         )
-        if source_matches and external_work is not None and external_work.waitable:
+        if source_matches and external_work.waitable:
             from . import runner as _runner_module
 
-            waited_s = 0.0
-            while True:
-                wait_reason, cadence_waited_s = _runner_module._run_external_work_wait(
-                    workdir=workdir,
-                    work_id=external_work.work_id,
-                    round_index=round_index,
-                    round_max=supervised_config.max_rounds,
-                    on_event=on_event,
-                    waited_total_s=waited_s,
-                )
-                waited_s += cadence_waited_s
-                if wait_reason != "cadence_elapsed":
-                    break
-                if process_stop.stop_requested():
-                    break
+            wait_reason, waited_s = _runner_module._run_external_work_wait(
+                workdir=workdir,
+                work_id=external_work.work_id,
+                round_index=round_index,
+                round_max=supervised_config.max_rounds,
+                on_event=on_event,
+                waited_total_s=0.0,
+            )
             state.last_decision_progress_at = _pause_decision_clock(
                 state.last_decision_progress_at,
                 waited_s,
             )
+            if wait_reason == "cadence_elapsed" and not process_stop.stop_requested():
+                session = state.engineer_session
+                return control_return((
+                    "paused_external_work",
+                    state.rounds,
+                    raw_engineer_message,
+                    (
+                        f"healthy {wait_kind} {external_work.work_id} is still "
+                        "running; released the mission slot"
+                    ),
+                    str(getattr(session, "thread_id", "") or "") or None,
+                ))
+            if wait_reason == "stop_requested" or process_stop.stop_requested():
+                session = state.engineer_session
+                return control_return((
+                    "paused_daemon_shutdown",
+                    state.rounds,
+                    raw_engineer_message,
+                    "daemon shutdown requested during external-work wait",
+                    str(getattr(session, "thread_id", "") or "") or None,
+                ))
+            # The wait ended because the external work changed state, so this
+            # round completed without touching the self-review phase — the
+            # only other place these counters reset. A turn that asked to
+            # wait was not a backend failure, so it ends any run of identical
+            # failures: the same-cause count restarts from one if that
+            # signature ever returns. Without this reset, a rate limit after
+            # the wait would read as the continuation of an outage that ended
+            # rounds ago and open the hold on an isolated accident.
+            state.backend_failure_streak = 0
+            state.backend_failure_signature = ""
+            state.backend_failure_same_cause_streak = 0
             return control_continue_loop()
         return control_proceed()

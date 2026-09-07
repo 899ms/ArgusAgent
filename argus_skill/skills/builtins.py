@@ -22,9 +22,8 @@ _BUILTIN_SEED_STATE = ".argus-builtin-seeds.json"
 _MOVED_SKILL_MARKER = ".moved-from-global.json"
 _LEGACY_BUILTIN_SEED_HASHES = {
     "agent-md-optimize-project-template.md": "52fbd7e60f85042624a54b563945b26739a590120d21c830c8f2d4eda0b3db7d",
-    "engineer/agent-team-lead.md": "bdaf7b78b57b3fec45bc9108d0c36f2bd0d07e191657cdffd4299c25f9f98722",
     "engineer/argus-engineer-role.md": "8823e0c01e377e1be5293d1529344213e0f1326ebe94a6863dc4ee0e2730dadd",
-    "engineer/environment-readiness-gate.md": "f8615f2a465cbe7b2ce838179c24a575baf4fbe6370730035c85cd4dd907de9b",
+    "engineer/environment-readiness.md": "f8615f2a465cbe7b2ce838179c24a575baf4fbe6370730035c85cd4dd907de9b",
     "engineer/mermaid-graphviz-diagrams.md": "d340f45b0aeb7ee5f239aa79f1c8f3ed94be4a56af036dd7b80a60cd72953542",
     "engineer/training-infrastructure-guide.md": "43d1cbc1017173a5376f2a47642ea3ba5bf007b879ba86737514f8aba28f3f39",
     "manager/argus-manager-role.md": "dc193f31dca3acd3041544745d97b832725c0e37b55a44bd9a93db5f97a631be",
@@ -33,6 +32,29 @@ _LEGACY_BUILTIN_SEED_HASHES = {
     "reviewer/argus-reviewer-role.md": "bc971a888bfcdc3acaca939b643410f509c328376737377ba8e898f1b4dee925",
 }
 _RETIRED_BUILTIN_SEED_HASHES = {
+    # Renamed on 2026-09-06 so that the library speaks like a researcher:
+    # reading the evidence, the strongest argument against, claims against
+    # evidence, a citation check, an environment readiness check, guiding the
+    # engineer. A seeded copy under the old name is removed when it still
+    # matches, archived otherwise.
+    "reviewer/experiment-audit.md": (
+        "67ab93f4bd258207d8eedf1f2c7b27455f50d76d746f61f07b4facd1a35dcff7"
+    ),
+    "reviewer/kill-argument.md": (
+        "a84fba34ce27bc8d2fcaba3a245d0ca4d49c5922f8401032c71e0f468eff0150"
+    ),
+    "engineer/citation-audit.md": (
+        "ee79f3b888dd2d60a36bd4e7efd771b345b24ca8bebf8827a4affd7d584834b2"
+    ),
+    "engineer/claims-evidence-audit.md": (
+        "de4fbd08530256ec6ac724051cf6d37e98917b0f7b24c120fbe198e4784474ce"
+    ),
+    "engineer/environment-readiness-gate.md": (
+        "a85d54656f5e5ffa7b5d8519456fc8e340e1df23d2f47f63a95f428bb75d7c71"
+    ),
+    "reviewer/reviewer-engineer-handoff.md": (
+        "e31210ceaab0cf524b0edc009615bf8aaee06e9c9c77656eb1509c1037a2f800"
+    ),
     "engineer/experiment-audit.md": (
         "d7fa41bfefaa0aaa8156f5febc8a4c1dc98874f3e7e24e6306f075266c49074e"
     ),
@@ -142,6 +164,62 @@ def iter_context_skill_texts(
     merged = dict(iter_vertical_skill_texts(vertical))
     if domain:
         merged.update(dict(iter_domain_skill_texts(domain)))
+    yield from merged.items()
+
+
+def _iter_reference_assets(
+    root: Traversable,
+    prefix: str = "",
+    *,
+    inside_references: bool = False,
+) -> Iterable[tuple[str, str]]:
+    """Yield supporting reference cards without making them matchable Skills."""
+    for entry in sorted(root.iterdir(), key=lambda item: item.name):
+        if entry.name.startswith(("_", ".")):
+            continue
+        relative_name = f"{prefix}{entry.name}"
+        if entry.is_dir():
+            yield from _iter_reference_assets(
+                entry,
+                f"{relative_name}/",
+                inside_references=(
+                    inside_references or entry.name == "references"
+                ),
+            )
+        elif inside_references and entry.name.endswith(".md"):
+            yield relative_name, entry.read_text(encoding="utf-8")
+
+
+def iter_context_skill_assets(
+    vertical: str,
+    domain: str | None = None,
+) -> Iterable[tuple[str, str]]:
+    """Yield reference corpora consumed by context Skills.
+
+    ``iter_context_skill_texts`` deliberately excludes ``references/`` because
+    those cards are not independently matchable Skills. Excluding them from the
+    seeder too left the owning Skill pointing at files that did not exist:
+    run-01 had 43 of 94 research resources and none of the 51 ideation cards.
+    """
+    from ..verticals._registry import vertical_plugin
+
+    merged: dict[str, str] = {}
+    for source_vertical in (
+        *_VERTICAL_SKILL_INHERITANCE.get(vertical, ()),
+        vertical,
+    ):
+        plugin = vertical_plugin(source_vertical)
+        root = (
+            plugin.skills_root
+            if plugin and plugin.skills_root is not None
+            else vertical_skill_source_path(source_vertical)
+        )
+        if root.is_dir():
+            merged.update(dict(_iter_reference_assets(root)))
+    if domain:
+        root = domain_skill_source_path(domain)
+        if root.is_dir():
+            merged.update(dict(_iter_reference_assets(root)))
     yield from merged.items()
 
 
@@ -395,6 +473,13 @@ def seed_builtin_skills_for_context(
             overwrite=overwrite,
         )
     )
+    created.update(
+        _seed_texts(
+            skills_dir,
+            iter_context_skill_assets(vertical, domain),
+            overwrite=overwrite,
+        )
+    )
 
     return created
 
@@ -434,6 +519,14 @@ def seed_context_skills(
         dest = skills_dir / filename
         if dest.exists() and not overwrite:
             _ = overwrite_unidentified
+            created[filename] = False
+            continue
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_write_text(dest, text)
+        created[filename] = True
+    for filename, text in iter_context_skill_assets(vertical, domain):
+        dest = skills_dir / filename
+        if dest.exists() and not overwrite:
             created[filename] = False
             continue
         dest.parent.mkdir(parents=True, exist_ok=True)

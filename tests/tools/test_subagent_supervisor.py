@@ -17,7 +17,6 @@ from argus_skill.core.models import RunnerResult
 from argus_skill.core.token_usage import sum_token_counts
 from argus_skill.tools import subagent as _sub
 from argus_skill.tools.subagent import (
-    SUPERVISOR_INTERVAL_CAP,
     _append_discussion,
     _build_report,
     _child_env,
@@ -159,17 +158,16 @@ def _skip_supervisor_summary(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(_sub._reporting, "_supervisor_summarize_report", lambda *args, **kwargs: "")
 
 
-def test_backoff_doubles_while_healthy_up_to_cap() -> None:
+def test_backoff_keeps_doubling_while_healthy() -> None:
     base = 120
     i = _next_monitor_interval("healthy", base, base)
     assert i == 240
     i = _next_monitor_interval("healthy", i, base)
     assert i == 480
     i = _next_monitor_interval("healthy", i, base)
-    assert i == min(960, SUPERVISOR_INTERVAL_CAP)
-    # Never exceeds the cap.
-    i = _next_monitor_interval("healthy", SUPERVISOR_INTERVAL_CAP, base)
-    assert i == SUPERVISOR_INTERVAL_CAP
+    assert i == 960
+    i = _next_monitor_interval("healthy", i, base)
+    assert i == 1920
 
 
 def test_backoff_snaps_back_to_base_when_unhealthy() -> None:
@@ -178,18 +176,16 @@ def test_backoff_snaps_back_to_base_when_unhealthy() -> None:
         assert _next_monitor_interval(bad, 900, base) == base
 
 
-def test_unknown_health_holds_steady_within_bounds() -> None:
+def test_unknown_health_holds_steady_with_floor() -> None:
     base = 120
     assert _next_monitor_interval("unknown", 300, base) == 300
-    # Held value is still capped and floored.
-    assert _next_monitor_interval("unknown", 99999, base) == SUPERVISOR_INTERVAL_CAP
+    assert _next_monitor_interval("unknown", 99999, base) == 99999
     assert _next_monitor_interval("unknown", 10, base) == base
 
 
-def test_cap_is_never_below_base() -> None:
-    # A base larger than the default cap must still be respected as the floor.
+def test_base_is_respected_as_the_floor() -> None:
     big_base = 1200
-    assert _next_monitor_interval("healthy", big_base, big_base) == big_base
+    assert _next_monitor_interval("healthy", big_base, big_base) == 2400
     assert _next_monitor_interval("degrading", 5000, big_base) == big_base
 
 
@@ -268,6 +264,127 @@ def test_clean_concern_treats_nothing_phrases_as_empty() -> None:
     assert _clean_concern("  clipped_ratio  is  1.0 ") == "clipped_ratio is 1.0"
 
 
+def test_clean_concern_keeps_real_anomaly_after_reassuring_opener() -> None:
+    # A calm opener followed by a substantive anomaly, with NO contrast/alarm
+    # token, must survive verbatim — only a note that IS the reassurance clears.
+    note = (
+        "No anomalies in the harness; training is stable. Reward has stayed "
+        "at 0.0 for the last 4000 steps and entropy is flat at its floor."
+    )
+    assert _clean_concern(note) == note
+
+
+def test_clean_concern_clause_review_clears_pure_reassurance() -> None:
+    # Multi-clause notes clear ONLY when every clause is itself a recognized
+    # reassurance.
+    assert _clean_concern("No anomalies. All good.") == ""
+    assert _clean_concern("no issues; none") == ""
+    # Trailing exclamation marks split into empty clauses, which never veto.
+    assert _clean_concern("No anomalies!!") == ""
+    # A decimal point is NOT a sentence boundary: this is one reassuring clause.
+    assert _clean_concern("No anomalies detected in epoch 1.5") == ""
+
+
+def test_clean_concern_clause_review_keeps_unrecognized_clauses() -> None:
+    # Any clause that is not a recognized reassurance keeps the WHOLE note,
+    # even without a contrast/alarm token (fail-safe toward review).
+    pivot = (
+        "No anomalies in the harness; training is stable. Reward has stayed "
+        "at 0.0 for the last 4000 steps."
+    )
+    assert _clean_concern(pivot) == pivot
+    # A newline is a clause boundary even without terminal punctuation; the
+    # kept note is whitespace-normalized as usual.
+    newline_note = "No anomalies in harness\nreward flat since step 4000"
+    assert _clean_concern(newline_note) == (
+        "No anomalies in harness reward flat since step 4000"
+    )
+
+
+def _do_one_check(monkeypatch, tmp_path, checks):
+    """Drive ``_supervised_do_one_check`` through a scripted check sequence."""
+    results = list(checks)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        _sub._supervised_run,
+        "_supervisor_check_with_usage",
+        lambda *a, **k: results.pop(0),
+    )
+
+    class _Stream:
+        def flush(self) -> None:
+            pass
+
+    return _sub._supervised_run._supervised_do_one_check(
+        task_id="sup-confirm",
+        command="python train.py",
+        description="demo",
+        out=_Stream(),
+        err=_Stream(),
+        check_number=1,
+        model="gpt-5.5",
+        cwd=str(tmp_path),
+        resolved_run_dir=None,
+        start_time=time.time(),
+        stdout_path=tmp_path / "out.log",
+        stderr_path=tmp_path / "err.log",
+        supervisor_log=tmp_path / "supervisor.jsonl",
+        supervisor_thread_id=None,
+        supervisor_usage_totals=(0, 0, 0, 0),
+    )
+
+
+def test_reconfirmed_concern_on_healthy_run_does_not_stop(
+    monkeypatch, tmp_path
+) -> None:
+    # Two rounds of reassurance phrasing that slipped past _clean_concern must
+    # not kill a run the supervisor itself still calls healthy: the confirming
+    # read has to corroborate with degraded health or decide early_stop.
+    def _check(concern: str) -> object:
+        return _sub._supervised_run.SupervisorCheck(
+            decision="continue", health="healthy", concern=concern,
+            thread_id="t1", usage=(1, 0, 1, 0), error=None,
+        )
+
+    (check_number, decision, health, concern, _thread, _totals, stop_now) = (
+        _do_one_check(monkeypatch, tmp_path, [
+            _check("Run looks nominal overall, will keep watching"),
+            _check("Everything still looks nominal overall"),
+        ])
+    )
+
+    assert stop_now is False
+    assert decision == "continue"
+    assert health == "healthy"
+    assert concern == ""  # cleared so status does not show a phantom anomaly
+    assert check_number == 2  # the confirmation re-check did run
+
+
+def test_reconfirmed_concern_with_degraded_health_stops(
+    monkeypatch, tmp_path
+) -> None:
+    # A real anomaly re-affirmed with degraded health stops the run even when
+    # the supervisor never says early_stop outright.
+    def _check(concern: str) -> object:
+        return _sub._supervised_run.SupervisorCheck(
+            decision="continue", health="stuck", concern=concern,
+            thread_id="t1", usage=(1, 0, 1, 0), error=None,
+        )
+
+    (check_number, decision, health, concern, _thread, _totals, stop_now) = (
+        _do_one_check(monkeypatch, tmp_path, [
+            _check("reward flat at 0.0 for the last 4000 steps"),
+            _check("reward is still flat at 0.0; no learning signal"),
+        ])
+    )
+
+    assert stop_now is True
+    assert decision == "early_stop"
+    assert health == "stuck"
+    assert concern == "reward is still flat at 0.0; no learning signal"
+    assert check_number == 2
+
+
 def test_live_codex_boundary_guard_blocks_unfaked_calls() -> None:
     with pytest.raises(AssertionError, match="live subagent backend turn"):
         _sub._llm._run_backend_turn("", "", ".", None, 1, "test")
@@ -299,11 +416,8 @@ def test_supervisor_check_concern_now_means_stop_in_prompt(monkeypatch, tmp_path
     assert "EMPTY" in prompt
 
 
-def test_supervisor_check_injects_rl_collapse_guidance(monkeypatch, tmp_path) -> None:
-    # The supervisor prompt must carry the RL-collapse-diagnosis skill so the
-    # model's stop/continue call is grounded in concrete collapse signatures
-    # (e.g. tail-window reward-variance death) rather than vibes.
-    monkeypatch.chdir(tmp_path)
+def _capture_supervisor_prompt(monkeypatch, tmp_path) -> dict[str, str]:
+    """Install a fake codex that records the supervisor prompt it receives."""
     captured: dict[str, str] = {}
 
     class _Result:
@@ -318,13 +432,108 @@ def test_supervisor_check_injects_rl_collapse_guidance(monkeypatch, tmp_path) ->
     _install_fake_codex(monkeypatch, fake_run)
     out = tmp_path / "stdout.log"
     err = tmp_path / "stderr.log"
-    out.write_text("step 1\n")
+    out.write_text("step 42: loss 0.5\n")
     err.write_text("")
-    _supervisor_check("t", "python train.py", "run", out, err, 60.0, 1, "gpt-5.5", str(tmp_path))
+    captured["stdout_path"] = str(out)
+    captured["stderr_path"] = str(err)
+    return captured
+
+
+def test_supervisor_check_injects_rl_collapse_guidance(monkeypatch, tmp_path) -> None:
+    # For an RL launch, the supervisor prompt must carry the
+    # RL-collapse-diagnosis skill so the model's stop/continue call is grounded
+    # in concrete collapse signatures (e.g. tail-window reward-variance death)
+    # rather than vibes.
+    monkeypatch.chdir(tmp_path)
+    captured = _capture_supervisor_prompt(monkeypatch, tmp_path)
+    _supervisor_check(
+        "t", "python train.py --num-generations 4", "run",
+        Path(captured["stdout_path"]), Path(captured["stderr_path"]),
+        60.0, 1, "gpt-5.5", str(tmp_path),
+    )
     prompt = captured["prompt"]
     assert "when an RL run has COLLAPSED" in prompt
     # The transient-vs-sustained judgement is the crux of the skill.
     assert "tail-window" in prompt or "tail window" in prompt.lower()
+
+
+def test_supervisor_check_omits_rl_guidance_for_non_rl_run(monkeypatch, tmp_path) -> None:
+    # An eval / SFT / generic launch gains nothing from ~12k characters of
+    # RL-collapse criteria on every check, so the reference stays home.
+    monkeypatch.chdir(tmp_path)
+    captured = _capture_supervisor_prompt(monkeypatch, tmp_path)
+    _supervisor_check(
+        "t", "python code/eval.py --benchmark math500", "eval run",
+        Path(captured["stdout_path"]), Path(captured["stderr_path"]),
+        60.0, 1, "gpt-5.5", str(tmp_path),
+    )
+    prompt = captured["prompt"]
+    assert "when an RL run has COLLAPSED" not in prompt
+    assert "reward-variance death" not in prompt.lower()
+    # The generic health rules and the concern policy still go out in full.
+    assert "STOPS the run" in prompt
+    assert "Decision rules:" in prompt
+
+
+def test_resumed_thread_check_sends_only_new_signals(monkeypatch, tmp_path) -> None:
+    # On a resumed thread the rules are already in the backend's context, so a
+    # later check sends just the fresh signals plus one line saying the earlier
+    # rules still apply — not the ~20k-character full prompt every 120s.
+    monkeypatch.chdir(tmp_path)
+    captured = _capture_supervisor_prompt(monkeypatch, tmp_path)
+    decision, health, _concern, thread_id = _supervisor_check(
+        "t", "python train.py --num-generations 4", "run",
+        Path(captured["stdout_path"]), Path(captured["stderr_path"]),
+        180.0, 3, "gpt-5.5", str(tmp_path), None, "t1",
+    )
+    prompt = captured["prompt"]
+    # The fresh signals still go out...
+    assert "step 42: loss 0.5" in prompt
+    assert "=== stdout" in prompt
+    # ...but none of the full rules are re-sent.
+    assert "You are a training/eval supervisor agent" not in prompt
+    assert "when an RL run has COLLAPSED" not in prompt
+    assert "STOPS the run" not in prompt
+    assert "Decision rules:" not in prompt
+    # One line points back at the rules already pinned on the thread.
+    assert "judgment rules from earlier in this conversation still apply" in prompt
+    # The reply still parses and the thread survives for the next check.
+    assert decision == "continue"
+    assert health == "healthy"
+    assert thread_id == "t1"
+
+
+def test_tenth_check_repins_full_rules_on_resumed_thread(monkeypatch, tmp_path) -> None:
+    # Every 10th check re-sends the full rules even on a live thread, so a long
+    # run can never drift arbitrarily far from the current wording.
+    monkeypatch.chdir(tmp_path)
+    captured = _capture_supervisor_prompt(monkeypatch, tmp_path)
+    _supervisor_check(
+        "t", "python train.py --num-generations 4", "run",
+        Path(captured["stdout_path"]), Path(captured["stderr_path"]),
+        1200.0, 10, "gpt-5.5", str(tmp_path), None, "t1",
+    )
+    prompt = captured["prompt"]
+    assert "You are a training/eval supervisor agent" in prompt
+    assert "STOPS the run" in prompt
+    assert "Decision rules:" in prompt
+    assert "when an RL run has COLLAPSED" in prompt
+
+
+def test_resume_recovery_on_lean_check_drops_thread(monkeypatch, tmp_path) -> None:
+    # If the resumed session is gone, the backend answers on a fresh thread that
+    # never saw the rules. The check must drop that thread so the NEXT check
+    # starts clean and sends the rules in full.
+    monkeypatch.chdir(tmp_path)
+    captured = _capture_supervisor_prompt(monkeypatch, tmp_path)
+    # The fake backend always reports thread "t1"; resuming "OLD" therefore
+    # looks exactly like a resume that fell back to a fresh conversation.
+    _decision, _health, _concern, thread_id = _supervisor_check(
+        "t", "python train.py --num-generations 4", "run",
+        Path(captured["stdout_path"]), Path(captured["stderr_path"]),
+        180.0, 3, "gpt-5.5", str(tmp_path), None, "OLD",
+    )
+    assert thread_id is None
 
 
 def test_rl_collapse_guidance_loads_and_strips_frontmatter() -> None:
@@ -334,6 +543,16 @@ def test_rl_collapse_guidance_loads_and_strips_frontmatter() -> None:
     assert guidance, "RL collapse guidance should load from the bundled skill"
     assert not guidance.startswith("---"), "YAML frontmatter must be stripped"
     assert "reward-variance death" in guidance.lower()
+
+
+def test_rl_collapse_guidance_for_attaches_only_to_rl_commands() -> None:
+    from argus_skill.tools.subagent import _rl_collapse_guidance_for
+
+    assert _rl_collapse_guidance_for("python train.py --num-generations 4")
+    assert _rl_collapse_guidance_for("python t.py --method MGR_RLVR --rollouts 8")
+    assert _rl_collapse_guidance_for("python code/eval.py --benchmark geneval") == ""
+    assert _rl_collapse_guidance_for("python sft_train.py --epochs 3") == ""
+    assert _rl_collapse_guidance_for("") == ""
 
 
 def test_supervisor_verdict_parses_concern_alongside_decision() -> None:
@@ -391,6 +610,23 @@ def test_direct_report_never_calls_llm(monkeypatch) -> None:
         },
     )
     assert "plain background command" in report
+
+
+def test_timeout_report_does_not_misclassify_timeout_as_failure() -> None:
+    report = _build_report(
+        "bounded-search",
+        "TIMEOUT",
+        {
+            "description": "bounded solver run",
+            "command": "solver problem.cnf",
+            "mode": "direct",
+            "elapsed_seconds": 3600,
+        },
+    )
+
+    assert "treat the result as inconclusive" in report
+    assert "Do not infer a workload failure from the timeout alone" in report
+    assert "inspect stderr for root cause" not in report
 
 
 def test_supervisor_authors_report_grounded_in_diagnosis(monkeypatch) -> None:
@@ -493,7 +729,7 @@ def test_supervisor_report_uses_persisted_submit_cwd(monkeypatch, tmp_path) -> N
     _write_task("train-cwd", {**task, "cwd": str(project)})
     seen: dict[str, str] = {}
 
-    def fake_turn(prompt, model, cwd, thread_id, timeout, run_label, mission_id=None):
+    def fake_turn(prompt, model, cwd, thread_id, run_label, mission_id=None):
         seen["cwd"] = cwd
         return RunnerResult(exit_code=0, agent_messages=["terminal report"])
 
@@ -515,7 +751,7 @@ def test_late_report_does_not_overwrite_reused_task_id(monkeypatch, tmp_path) ->
     }
     _write_task("reused", dict(old_task))
 
-    def fake_turn(prompt, model, cwd, thread_id, timeout, run_label, mission_id=None):
+    def fake_turn(prompt, model, cwd, thread_id, run_label, mission_id=None):
         _write_task(
             "reused",
             {
@@ -803,6 +1039,12 @@ def test_cmd_reply_reads_utf8_message_file(monkeypatch, tmp_path, capsys) -> Non
 
 
 def test_queue_fallback_writes_utf8_report(monkeypatch, tmp_path) -> None:
+    """The forensic copy keeps its UTF-8 contract — and no longer passes for delivery.
+
+    The alert file used to be the whole failure path: written, and then silently
+    returned from as though the engineer had been told. It is still written, but
+    the caller now learns the report never landed.
+    """
     monkeypatch.setattr(_sub._reporting, "REGISTRY_DIR", tmp_path)
     monkeypatch.setattr(
         "argus_skill.apps._inbox.queue_inbox_message",
@@ -810,7 +1052,8 @@ def test_queue_fallback_writes_utf8_report(monkeypatch, tmp_path) -> None:
     )
     report = "实验报告 🔬 → α"
 
-    _sub._reporting._queue_to_inbox(report, task_id="unicode")
+    with pytest.raises(_sub._reporting.InboxDeliveryError):
+        _sub._reporting._queue_to_inbox(report, task_id="unicode")
 
     assert (tmp_path / "unicode_ALERT.md").read_text(encoding="utf-8") == report + "\n"
 
@@ -877,13 +1120,12 @@ def test_run_discussion_processes_preexisting_engineer_turn(monkeypatch, tmp_pat
 def test_run_codex_resumes_thread_through_backend(monkeypatch, tmp_path) -> None:
     calls: dict[str, object] = {}
 
-    def fake_turn(prompt, model, cwd, thread_id, timeout, run_label, mission_id=None):
+    def fake_turn(prompt, model, cwd, thread_id, run_label, mission_id=None):
         calls.update(
             prompt=prompt,
             model=model,
             cwd=cwd,
             thread_id=thread_id,
-            timeout=timeout,
             run_label=run_label,
         )
         return RunnerResult(
@@ -905,7 +1147,7 @@ def test_run_codex_retries_fresh_when_resume_empty(monkeypatch, tmp_path) -> Non
     # A resume that yields no agent message (expired session) retries once fresh.
     seq: list[str | None] = []
 
-    def fake_turn(prompt, model, cwd, thread_id, timeout, run_label, mission_id=None):
+    def fake_turn(prompt, model, cwd, thread_id, run_label, mission_id=None):
         seq.append(thread_id)
         if thread_id:
             return RunnerResult(exit_code=1, thread_id=thread_id)
@@ -941,7 +1183,6 @@ def test_backend_turn_uses_accounted_agent_backend(monkeypatch, tmp_path) -> Non
         "gpt-5.5",
         str(tmp_path),
         "OLD",
-        30,
         "subagent:train-1:health",
         "train-1-run-42",
     )
@@ -959,8 +1200,11 @@ def test_backend_turn_uses_accounted_agent_backend(monkeypatch, tmp_path) -> Non
     assert run_call["options"].working_dir == str(tmp_path)
 
 
-def test_supervisor_backend_inherits_configured_runner(monkeypatch) -> None:
+def test_supervisor_role_backend_does_not_inherit_shared_runner(monkeypatch) -> None:
+    from argus_skill.core import knob_store
+
     constructed: dict[str, object] = {}
+    resolved: list[tuple[str, str | None]] = []
 
     class _Backend:
         def __init__(self, **kwargs) -> None:
@@ -968,20 +1212,28 @@ def test_supervisor_backend_inherits_configured_runner(monkeypatch) -> None:
 
     monkeypatch.setattr(_sub._llm, "_SUPERVISOR_BACKENDS", {})
     monkeypatch.setattr(_sub._llm, "AgentCliBackend", _Backend)
+    monkeypatch.setenv("ARGUS_SKILL_SUPERVISOR_BACKEND", "copilot")
+    monkeypatch.delenv("ARGUS_SKILL_SUPERVISOR_RUNNER_BIN", raising=False)
+    monkeypatch.delenv("ARGUS_SKILL_RUNNER_BACKEND", raising=False)
+    monkeypatch.delenv("ARGUS_SKILL_LIFE_BACKEND", raising=False)
+    monkeypatch.delenv("ARGUS_SKILL_RUNNER_BIN", raising=False)
     monkeypatch.setattr(
-        _sub._llm,
-        "resolve_role_backend",
-        lambda role: "copilot" if role == "supervisor" else "codex",
+        knob_store,
+        "read_persisted_knobs",
+        lambda: {
+            "ARGUS_SKILL_RUNNER_BACKEND": "dsh",
+            "ARGUS_SKILL_RUNNER_BIN": "/opt/dsh",
+        },
     )
-    monkeypatch.setattr(
-        _sub._llm,
-        "resolve_runner_bin_setting",
-        lambda role: "/opt/copilot" if role == "supervisor" else "",
-    )
+
+    def resolve(backend: str, configured: str | None):
+        resolved.append((backend, configured))
+        return backend, configured or "/opt/copilot"
+
     monkeypatch.setattr(
         _sub._llm,
         "resolve_available_runner",
-        lambda backend, configured: (backend, configured),
+        resolve,
     )
 
     backend = _sub._llm._supervisor_backend()
@@ -989,6 +1241,7 @@ def test_supervisor_backend_inherits_configured_runner(monkeypatch) -> None:
     assert isinstance(backend, _Backend)
     assert constructed["backend"] == "copilot"
     assert constructed["runner_bin"] == "/opt/copilot"
+    assert resolved == [("copilot", None)]
 
 
 def test_run_supervised_persists_supervisor_usage_totals(monkeypatch, tmp_path) -> None:
@@ -1016,12 +1269,19 @@ def test_run_supervised_persists_supervisor_usage_totals(monkeypatch, tmp_path) 
     monkeypatch.setattr(
         _sub._supervised_run,
         "_supervisor_check_with_usage",
-        lambda *a, **k: ("continue", "healthy", "", "sup-thread", (120, 15, 30, 6)),
+        lambda *a, **k: _sub._supervised_run.SupervisorCheck(
+            decision="continue",
+            health="healthy",
+            concern="",
+            thread_id="sup-thread",
+            usage=(120, 15, 30, 6),
+            error=None,
+        ),
     )
 
     _sub._run_supervised(
         "train-1",
-        "python -c pass",
+        f"{shlex.quote(sys.executable)} -c pass",
         "demo",
         timeout=999,
         monitor_interval=1,
@@ -1038,7 +1298,9 @@ def test_run_supervised_persists_supervisor_usage_totals(monkeypatch, tmp_path) 
     assert record["supervisor_reasoning_output_tokens"] == 6
 
 
-def test_open_discussion_blockers_only_counts_live_fresh(monkeypatch, tmp_path) -> None:
+def test_open_discussion_blockers_use_process_identity_not_heartbeat_age(
+    monkeypatch, tmp_path
+) -> None:
     monkeypatch.chdir(tmp_path)
     me = __import__("os").getpid()
     # Live + fresh -> blocks.
@@ -1047,11 +1309,11 @@ def test_open_discussion_blockers_only_counts_live_fresh(monkeypatch, tmp_path) 
     # Dead pid -> ignored.
     _write_task("dead", {"state": "discussing", "task_id": "dead",
                          "worker_pid": 999999, "last_heartbeat": time.time()})
-    # Stale heartbeat -> ignored.
+    # An old heartbeat during a long model turn does not override live identity.
     _write_task("stale", {"state": "discussing", "task_id": "stale",
                           "worker_pid": me, "last_heartbeat": time.time() - 99999})
     ids = {t["task_id"] for t in _sub._open_discussion_blockers()}
-    assert ids == {"live"}
+    assert ids == {"live", "stale"}
 
 
 def _submit_args(**kw) -> argparse.Namespace:
@@ -1378,6 +1640,108 @@ def test_cmd_submit_normalizes_relative_cwd_and_run_dir(
     assert record is not None
     assert record["cwd"] == str(project)
     assert record["run_dir"] == str(project / "experiments" / "run-1")
+
+
+@requires_fork
+def test_experiment_submit_without_timeout_records_no_timeout(
+    monkeypatch,
+    tmp_path,
+    capsys,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(_sub._cli.os, "fork", lambda: 4242)
+
+    rc = _sub.cmd_submit(_submit_args(
+        task_id="default-timeout",
+        run_dir="experiments/run-1",
+        timeout=None,
+    ))
+    output = json.loads(capsys.readouterr().out)
+    record = _sub._read_task("default-timeout")
+
+    assert rc == 0
+    assert record is not None
+    assert record["timeout_seconds"] is None
+    assert record["timeout_defaulted"] is False
+    assert output["timeout_seconds"] is None
+    assert output["timeout_defaulted"] is False
+    assert "timeout_notice" not in output
+    assert record["worker_process_identity"]["pid"] == 4242
+
+
+def test_submit_without_timeout_survives_past_old_default(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from argus_skill.tools.subagent import _direct_run
+
+    monkeypatch.chdir(tmp_path)
+    clock = [100.0]
+    _write_task("timed", {
+        "state": "starting",
+        "task_id": "timed",
+        "run_id": "timed-run-1",
+        "timeout_seconds": None,
+        "timeout_defaulted": False,
+    })
+
+    class _Proc:
+        pid = os.getpid()
+        returncode = None
+
+        def wait(self, timeout=None):
+            assert timeout is None
+            clock[0] += 7201
+            self.returncode = 0
+
+    proc = _Proc()
+    writes: list[dict] = []
+    alerts: list[str] = []
+    real_write = _sub._registry._write_task
+
+    def record_write(task_id, data):
+        writes.append(dict(data))
+        real_write(task_id, data)
+
+    monkeypatch.setattr(
+        _direct_run,
+        "experiment_launch_preflight",
+        lambda **_kwargs: (False, ""),
+    )
+    monkeypatch.setattr(
+        _direct_run,
+        "release_experiment_launch_claim",
+        lambda **_kwargs: None,
+    )
+    monkeypatch.setattr(_direct_run, "_launch_durable_command", lambda **_kwargs: proc)
+    monkeypatch.setattr(_direct_run, "acquire_for_task", lambda *args, **kwargs: None)
+    monkeypatch.setattr(_direct_run.time, "time", lambda: clock[0])
+    monkeypatch.setattr(_direct_run, "_write_task", record_write)
+    monkeypatch.setattr(
+        _direct_run,
+        "_alert_engineer",
+        lambda task_id, event, data: alerts.append(
+            event
+        ),
+    )
+
+    _direct_run._run_direct(
+        "timed",
+        "python train.py",
+        "long experiment",
+        timeout=None,
+        cwd=str(tmp_path),
+        run_dir=str(tmp_path / "run"),
+    )
+
+    record = _sub._read_task("timed")
+    running = next(row for row in writes if row.get("state") == "running")
+    assert running["timeout_seconds"] is None
+    assert running["timeout_defaulted"] is False
+    assert running["process_identity"]["pid"] == proc.pid
+    assert record is not None and record["state"] == "done"
+    assert record["elapsed_seconds"] == 7201.0
+    assert alerts == ["COMPLETED"]
 
 
 def test_launch_durable_command_uses_native_powershell_on_windows(

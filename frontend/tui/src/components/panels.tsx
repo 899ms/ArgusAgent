@@ -21,6 +21,8 @@ import { buildEventLines } from '../eventLines.js';
 import { roleColor, toneColor } from '../eventRender.js';
 import { activityHistory } from '../../../core/src/activity.js';
 import { CostGauge } from './CostGauge.js';
+import type { ResourceStatus } from '../../../core/src/resourceStatus.generated.js';
+import { ResourceStatusView } from './ResourceStatus.js';
 
 /** The overlay panel opened by a read/inspect slash command. Loosely-typed
  *  container; each panel body is a typed component below. */
@@ -111,8 +113,10 @@ export function PanelView({
       );
     case 'help':
       return <HelpPanel page={panel.page ?? 0} pageSize={pageSize} />;
-    case 'status':
-      return <StatusPanel s={panel.data as StatusView} />;
+    case 'status': {
+      const [status, resources] = panel.data as [StatusView, ResourceStatus];
+      return <StatusPanel s={status} resources={resources} />;
+    }
     case 'doctor':
       return <DoctorPanel r={panel.data as DoctorReport} />;
     case 'backlog':
@@ -278,7 +282,7 @@ function HelpPanel({ page, pageSize }: { page: number; pageSize: number }) {
   );
 }
 
-function StatusPanel({ s }: { s: StatusView }) {
+function StatusPanel({ s, resources }: { s: StatusView; resources: ResourceStatus }) {
   return (
     <Frame title="/status">
       <Row k="daemon" v={s.daemon.alive ? `● alive (pid ${s.daemon.pid})` : '○ no daemon'} c={s.daemon.alive ? theme.success : 'gray'} />
@@ -310,6 +314,8 @@ function StatusPanel({ s }: { s: StatusView }) {
           <Text dimColor>{`identity: ${s.identity.split('\n')[0].slice(0, 70)}`}</Text>
         </>
       ) : null}
+      <Text> </Text>
+      <ResourceStatusView status={resources} />
     </Frame>
   );
 }
@@ -560,13 +566,13 @@ function ArtifactsPanel({ rows, selected, pageSize }: { rows: ArtifactInfo[]; se
   const view = pageSlice(rows, Math.floor(safeSelection / pageSize), pageSize);
   return (
     <Frame
-      title="/artifacts — latest reviewed result"
+      title="/artifacts — files from the latest reviewed result"
       page={view.page}
       pages={view.pages}
       hint={`↑/k ↓/j select${view.pages > 1 ? ` · page ${view.page + 1}/${view.pages}` : ''} · Enter preview · Esc close`}
     >
       {rows.length === 0 ? (
-        <Text dimColor>(the latest result has no reviewer-approved files)</Text>
+        <Text dimColor>(the latest result has no files the Reviewer has checked)</Text>
       ) : (
         view.shown.map((artifact, index) => {
           const focused = view.page * pageSize + index === safeSelection;
